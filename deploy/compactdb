@@ -27,7 +27,11 @@ dashboard() {
   total_files=$(field remote_package_files)
   bytes=$(field downloaded_bytes)
   total_bytes=$(field total_bytes)
-  bot=$(systemctl is-active compactdb-bot.service 2>/dev/null || true)
+  if /usr/local/bin/compactdb-observer compactdb-bot.service >/dev/null 2>&1; then
+    bot=healthy
+  else
+    bot=unhealthy
+  fi
 
   printf 'Phase: %s\n' "$phase"
   printf 'Download: %s\n' "$download"
@@ -55,6 +59,7 @@ case "$command" in
   status)
     need_root status "$@"
     dashboard
+    /usr/local/bin/compactdb-observer compactdb-bot.service || true
     printf 'Deploy service: %s\n' "$(systemctl is-active compactdb-deploy.service 2>/dev/null || true)"
     printf 'App revision: %s\n' "$(field application_revision)"
     ;;
@@ -84,6 +89,18 @@ case "$command" in
     need_root update "$@"
     systemctl start compactdb-update.service
     ;;
+  repair)
+    need_root repair "$@"
+    [[ -f /opt/compactdb/repository/deploy/install.sh ]] || {
+      printf '%s\n' 'Installed repository is unavailable.' >&2
+      exit 1
+    }
+    COMPACTDB_REPOSITORY_MODE=1 \
+    COMPACTDB_REPAIR_ONLY=1 \
+    COMPACTDB_NO_PROGRESS=1 \
+      bash /opt/compactdb/repository/deploy/install.sh
+    dashboard
+    ;;
   rollback)
     need_root rollback "$@"
     [[ -L /opt/compactdb/previous ]] || { printf '%s\n' 'No previous release is available.' >&2; exit 1; }
@@ -96,7 +113,7 @@ case "$command" in
     systemctl restart compactdb-bot.service
     ;;
   *)
-    printf '%s\n' 'Usage: compactdb {status|progress|logs|start|stop|restart|update|rollback}' >&2
+    printf '%s\n' 'Usage: compactdb {progress|status|logs|restart|stop|repair|start|update|rollback}' >&2
     exit 2
     ;;
 esac

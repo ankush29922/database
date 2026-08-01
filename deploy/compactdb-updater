@@ -27,15 +27,17 @@ release=/opt/compactdb/releases/$revision
 mkdir -p "$release"
 cp -a "$root/app/." "$release/"
 chown -R root:root "$release"; chmod -R a-w "$release"
-requirements=$(stat -c '%s:%Y' "$root/requirements.lock")
-installed=$(cat /opt/compactdb/.requirements-metadata 2>/dev/null || true)
+requirements=$(cksum "$root/requirements.lock" | awk '{print $1 ":" $2}')
+installed=$(cat /opt/compactdb/venv.requirements 2>/dev/null || true)
 if [[ "$requirements" != "$installed" ]]; then
   python3 -m venv "$work/venv"
   "$work/venv/bin/pip" install --disable-pip-version-check -r "$root/requirements.lock" >/dev/null
   rm -rf /opt/compactdb/venv.previous
   [[ -d /opt/compactdb/venv ]] && mv /opt/compactdb/venv /opt/compactdb/venv.previous
   mv "$work/venv" /opt/compactdb/venv
-  printf '%s\n' "$requirements" >/opt/compactdb/.requirements-metadata
+  printf '%s\n' "$requirements" >/opt/compactdb/venv.requirements
+  chown root:compactdb /opt/compactdb/venv.requirements
+  chmod 0640 /opt/compactdb/venv.requirements
 fi
 old=$(readlink -f /opt/compactdb/current)
 ln -sfn "$old" /opt/compactdb/previous

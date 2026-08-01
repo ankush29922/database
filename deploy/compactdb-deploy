@@ -185,6 +185,23 @@ metadata_is_exact() {
      manifest_bytes == EXPECTED_MANIFEST_BYTES ))
 }
 
+secure_database_artifacts() {
+  local database path
+  database="$PACKAGE/database"
+  install -d -o root -g compactdb -m 0750 "$database"
+  for path in \
+    "$database/compactdb-final.duckdb" \
+    "$database/compactdb-lookup.duckdb" \
+    "$database/compactdb-direct-locator.bin" \
+    "$database/compactdb-direct-locator.json"; do
+    [[ -f "$path" ]] || fail 21 PACKAGE_METADATA_INCOMPLETE permissions 'a required database artifact is missing' 21
+    chown root:compactdb "$path"
+    chmod 0640 "$path"
+  done
+  chown root:compactdb "$PACKAGE" "$database"
+  chmod 0750 "$PACKAGE" "$database"
+}
+
 started=$(date -u +%FT%TZ)
 if [[ -s "$STATE" ]]; then
   started=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("deployment_start_time") or sys.argv[2])' "$STATE" "$started")
@@ -204,23 +221,54 @@ else
   CURRENT_ERROR_CLASS=CONFIGURATION_MISSING
   (( deploy_config_load_code == 0 )) ||
     fail 20 CONFIGURATION_MISSING deploy.env 'deployment configuration could not be loaded' 20
-  method=${DOWNLOAD_METHOD:-}
-  if [[ "$method" != rclone && "$method" != gdown ]]; then
+  method=${DOWNLOAD_METHOD:-auto}
+  if [[ "$method" != rclone && "$method" != gdown && "$method" != auto ]]; then
     fail 20 CONFIGURATION_MISSING deploy.env 'DOWNLOAD_METHOD is required for an incomplete package' 20
   fi
+  rclone_configured=no
+  gdown_configured=no
+  [[ -n ${RCLONE_REMOTE_SOURCE:-} && -s /etc/compactdb/rclone.conf ]] && rclone_configured=yes
+  [[ -n ${GDRIVE_URL:-} ]] && gdown_configured=yes
+  fallback=${GDOWN_FALLBACK_RCLONE:-yes}
+  case "$method" in
+    rclone)
+      [[ "$rclone_configured" == yes ]] || fail 20 CONFIGURATION_MISSING deploy.env 'rclone source or configuration is missing' 20
+      transfer_plan=rclone
+      ;;
+    gdown)
+      if [[ "$gdown_configured" == yes && "$fallback" == yes && "$rclone_configured" == yes ]]; then
+        transfer_plan=gdown_then_rclone
+      elif [[ "$gdown_configured" == yes ]]; then
+        transfer_plan=gdown
+      elif [[ "$fallback" == yes && "$rclone_configured" == yes ]]; then
+        transfer_plan=rclone
+      else
+        fail 20 CONFIGURATION_MISSING deploy.env 'gdown URL and rclone fallback are unavailable' 20
+      fi
+      ;;
+    auto)
+      if [[ "$gdown_configured" == yes && "$rclone_configured" == yes ]]; then
+        transfer_plan=gdown_then_rclone
+      elif [[ "$gdown_configured" == yes ]]; then
+        transfer_plan=gdown
+      elif [[ "$rclone_configured" == yes ]]; then
+        transfer_plan=rclone
+      else
+        fail 20 CONFIGURATION_MISSING deploy.env 'no Google Drive download method is configured' 20
+      fi
+      ;;
+  esac
   streams=${RCLONE_STREAMS:-8}
   [[ "$streams" == 8 || "$streams" == 4 ]] || streams=8
   profile="MAX_SPEED_${streams}_STREAM"
-  state current_phase=PREFLIGHT source_method="$method" deployment_start_time="$started" last_error_class=null
+  state current_phase=PREFLIGHT source_method="$transfer_plan" deployment_start_time="$started" last_error_class=null
 
   read -r disk_total disk_free fs_type < <(df -B1 --output=size,avail,fstype "$PACKAGE" | awk 'NR==2{print $1,$2,$3}')
   memory_available=$(awk '/MemAvailable:/{print $2*1024}' /proc/meminfo)
   swap_total=$(awk '/SwapTotal:/{print $2*1024}' /proc/meminfo)
   existing=$local_bytes
 
-  if [[ "$method" == rclone ]]; then
-    [[ -n ${RCLONE_REMOTE_SOURCE:-} && -s /etc/compactdb/rclone.conf ]] ||
-      fail 20 CONFIGURATION_MISSING deploy.env 'rclone source or configuration is missing' 20
+  if [[ "$transfer_plan" == rclone || "$transfer_plan" == gdown_then_rclone ]]; then
     CURRENT_ERROR_CLASS=RCLONE_TRANSFER_FAILED
     size_output=$(mktemp /run/compactdb-rclone-size.XXXXXX)
     set +e
@@ -235,12 +283,10 @@ else
     remote_files=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["count"]))' "$size_output")
     rm -f -- "$size_output"
   else
-    [[ ${REMOTE_PACKAGE_BYTES:-} =~ ^[0-9]+$ ]] ||
-      fail 20 CONFIGURATION_MISSING deploy.env 'REMOTE_PACKAGE_BYTES is required for gdown preflight' 20
-    [[ -n ${GDRIVE_URL:-} ]] ||
-      fail 20 CONFIGURATION_MISSING deploy.env 'GDRIVE_URL is required for gdown transfer' 20
-    remote_bytes=$REMOTE_PACKAGE_BYTES
-    remote_files=${REMOTE_PACKAGE_FILES:-0}
+    remote_bytes=${REMOTE_PACKAGE_BYTES:-$EXPECTED_BYTES}
+    remote_files=${REMOTE_PACKAGE_FILES:-$EXPECTED_FILES}
+    [[ "$remote_bytes" =~ ^[0-9]+$ && "$remote_files" =~ ^[0-9]+$ ]] ||
+      fail 20 CONFIGURATION_MISSING deploy.env 'gdown package metadata must be numeric' 20
   fi
 
   remaining=$((remote_bytes - existing))
@@ -297,6 +343,7 @@ else
       --config /etc/compactdb/rclone.conf \
       --transfers 1 --checkers 2 --buffer-size 8M \
       --multi-thread-streams "$streams" --multi-thread-cutoff 256M \
+      --partial-suffix .partial \
       --ignore-checksum --use-mmap --bwlimit off \
       --retries 20 --retries-sleep 30s --low-level-retries 20 \
       --timeout 5m --contimeout 30s --stats 15s --stats-one-line --log-level ERROR \
@@ -318,7 +365,7 @@ else
     CURRENT_ERROR_CLASS=GDOWN_TRANSFER_FAILED
     if [[ ! -x /opt/compactdb/deploy-venv/bin/gdown ]]; then
       run_quiet GDOWN_TRANSFER_FAILED python3 1 python3 -m venv /opt/compactdb/deploy-venv
-      run_quiet GDOWN_TRANSFER_FAILED pip 1 /opt/compactdb/deploy-venv/bin/pip install --disable-pip-version-check 'gdown==5.2.0'
+      run_quiet GDOWN_TRANSFER_FAILED pip 1 /opt/compactdb/deploy-venv/bin/pip install --disable-pip-version-check -r "$SOURCE/deploy/requirements.lock"
     fi
     local attempt=1
     while (( attempt <= 5 )); do
@@ -334,11 +381,28 @@ else
       attempt=$((attempt + 1))
       sleep 30
     done
-    fail "$transfer_code" GDOWN_TRANSFER_FAILED gdown 'gdown transfer failed after its configured retries' 1
+    return "$transfer_code"
   }
 
-  safe_log "phase=download method=$method remote_bytes=$remote_bytes remote_files=$remote_files"
-  if [[ "$method" == rclone ]]; then run_rclone; else run_gdown; fi
+  safe_log "phase=download method=$transfer_plan remote_bytes=$remote_bytes remote_files=$remote_files"
+  case "$transfer_plan" in
+    rclone)
+      run_rclone
+      ;;
+    gdown)
+      run_gdown || fail "$?" GDOWN_TRANSFER_FAILED gdown 'gdown transfer failed after its configured retries' 1
+      ;;
+    gdown_then_rclone)
+      if run_gdown; then
+        state selected_download_method=gdown
+      else
+        state current_phase=FALLING_BACK_TO_RCLONE last_error_class=GDOWN_TRANSFER_FAILED
+        safe_log 'phase=fallback from=gdown to=rclone'
+        run_rclone
+        state selected_download_method=rclone
+      fi
+      ;;
+  esac
   rm -f -- "$inventory"
 
   metadata_snapshot
@@ -351,6 +415,11 @@ else
     remote_package_files="$EXPECTED_FILES" total_local_files="$EXPECTED_FILES" \
     current_rate=0 average_rate=0 network_receive_rate=0 eta_seconds=0 last_error_class=null
 fi
+
+CURRENT_PHASE=SECURING_DATABASE_ARTIFACTS
+CURRENT_ERROR_CLASS=PACKAGE_METADATA_INCOMPLETE
+state current_phase=SECURING_DATABASE_ARTIFACTS
+secure_database_artifacts
 
 CURRENT_PHASE=INSTALLING_APPLICATION
 CURRENT_ERROR_CLASS=APPLICATION_INSTALL_FAILED
@@ -386,8 +455,8 @@ mv -Tf /opt/compactdb/app.new /opt/compactdb/app
 CURRENT_PHASE=CREATING_VENV
 CURRENT_ERROR_CLASS=VENV_INSTALL_FAILED
 state current_phase=CREATING_VENV application_revision="$revision"
-requirements_marker=$(stat -c '%s:%Y' "$SOURCE/requirements.lock")
-installed_marker=$(cat /opt/compactdb/.requirements-metadata 2>/dev/null || true)
+requirements_marker=$(cksum "$SOURCE/requirements.lock" | awk '{print $1 ":" $2}')
+installed_marker=$(cat /opt/compactdb/venv.requirements 2>/dev/null || true)
 if [[ ! -x /opt/compactdb/venv/bin/python || "$requirements_marker" != "$installed_marker" ]]; then
   venv_staging=/opt/compactdb/venv.new
   rm -rf -- "$venv_staging"
@@ -396,7 +465,9 @@ if [[ ! -x /opt/compactdb/venv/bin/python || "$requirements_marker" != "$install
   rm -rf -- /opt/compactdb/venv.previous
   [[ ! -d /opt/compactdb/venv ]] || mv /opt/compactdb/venv /opt/compactdb/venv.previous
   mv "$venv_staging" /opt/compactdb/venv
-  printf '%s\n' "$requirements_marker" >/opt/compactdb/.requirements-metadata
+  printf '%s\n' "$requirements_marker" >/opt/compactdb/venv.requirements
+  chown root:compactdb /opt/compactdb/venv.requirements
+  chmod 0640 /opt/compactdb/venv.requirements
 fi
 
 CURRENT_PHASE=CONFIGURING_BOT
@@ -424,23 +495,22 @@ systemctl reset-failed compactdb-bot.service >/dev/null 2>&1 || true
 run_quiet BOT_START_FAILED systemctl 25 systemctl start --no-block compactdb-bot.service
 
 startup_deadline=$((SECONDS + 75))
-start_restarts=$(systemctl show compactdb-bot.service -p NRestarts --value 2>/dev/null || printf 0)
+observer_output=
 while (( SECONDS < startup_deadline )); do
-  bot_state=$(systemctl is-active compactdb-bot.service 2>/dev/null || true)
-  bot_restarts=$(systemctl show compactdb-bot.service -p NRestarts --value 2>/dev/null || printf 0)
-  if [[ "$bot_state" == active ]]; then
+  set +e
+  observer_output=$(/usr/local/bin/compactdb-observer compactdb-bot.service 2>/dev/null)
+  observer_code=$?
+  set -e
+  if (( observer_code == 0 )); then
     break
-  fi
-  if [[ "$bot_state" == failed || "$bot_state" == inactive || "$bot_restarts" -gt "$start_restarts" ]]; then
-    systemctl stop compactdb-bot.service >/dev/null 2>&1 || true
-    fail 25 BOT_START_FAILED compactdb-bot.service 'bot exited before reporting ready; service was stopped' 25
   fi
   sleep 1
 done
-if ! systemctl is-active --quiet compactdb-bot.service; then
-  systemctl stop compactdb-bot.service >/dev/null 2>&1 || true
-  fail 25 BOT_START_FAILED compactdb-bot.service 'bot did not report ready within 75 seconds; service was stopped' 25
+if (( ${observer_code:-1} != 0 )); then
+  fail 25 BOT_START_FAILED compactdb-bot.service 'bot did not reach active/running with a nonzero MainPID within 75 seconds' 25
 fi
+telegram_started=no
+grep -Fqx 'TELEGRAM_APPLICATION_STARTED=yes' <<<"$observer_output" && telegram_started=yes
 
 completed=$(date -u +%FT%TZ)
 state current_phase=COMPLETE DOWNLOAD_STATUS=COMPLETE_BY_EXACT_METADATA \
@@ -448,6 +518,8 @@ state current_phase=COMPLETE DOWNLOAD_STATUS=COMPLETE_BY_EXACT_METADATA \
   completed_files="$EXPECTED_FILES" remote_package_files="$EXPECTED_FILES" \
   total_local_files="$EXPECTED_FILES" current_rate=0 average_rate=0 network_receive_rate=0 \
   eta_seconds=0 deployment_completion_time="$completed" bot_service_state=active \
-  database_mode=read-only full_scan_fallback=false last_error_class=null
+  bot_service_substate=running telegram_application_started="$telegram_started" \
+  database_mode=read-only direct_locator=required lookup_sidecar=required \
+  full_scan_fallback=false last_error_class=null
 safe_log "phase=complete bot=active revision=$revision"
 /usr/local/bin/compactdb-notify deployment-complete >/dev/null 2>&1 || true

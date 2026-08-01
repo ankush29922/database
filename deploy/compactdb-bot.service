@@ -3,7 +3,11 @@ Description=CompactDB Telegram bot
 After=network-online.target
 Wants=network-online.target
 ConditionPathExists=/srv/compactdb/CompactDB-Portable/database/compactdb-final.duckdb
-StartLimitIntervalSec=0
+ConditionPathExists=/srv/compactdb/CompactDB-Portable/database/compactdb-lookup.duckdb
+ConditionPathExists=/srv/compactdb/CompactDB-Portable/database/compactdb-direct-locator.bin
+ConditionPathExists=/srv/compactdb/CompactDB-Portable/database/compactdb-direct-locator.json
+StartLimitIntervalSec=10min
+StartLimitBurst=10
 
 [Service]
 Type=notify
@@ -27,6 +31,7 @@ Restart=always
 RestartSec=5
 RestartSteps=6
 RestartMaxDelaySec=5min
+KillMode=control-group
 TimeoutStopSec=20
 WatchdogSec=75
 MemoryHigh=560M

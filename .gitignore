@@ -26,3 +26,6 @@ runtime/
 deployment-state.json
 notification-state.json
 notification-pending.json
+.test-bootstrap.*
+.test-idempotency.*
+.test-observer.*
