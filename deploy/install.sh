@@ -88,9 +88,8 @@ installer_phase() {
   swap_used=$((swap_total - swap_free))
   python3 - "$state_path" \
     current_phase="$phase" deployment_start_time="$started" hostname="$(hostname)" \
-    configured_download_method="$method" percentage=0 downloaded_bytes=0 total_bytes=0 \
-    current_rate=0 average_rate=0 eta_seconds=0 completed_files=0 remote_package_files=0 \
-    retries=0 disk_total="$disk_total" disk_free="$disk_free" memory_total="$memory_total" \
+    configured_download_method="$method" retries=0 disk_total="$disk_total" \
+    disk_free="$disk_free" memory_total="$memory_total" \
     memory_available="$memory_available" swap_total="$swap_total" swap_used="$swap_used" \
     bot_service_state=inactive last_error_class=null error_timestamp=null failed_phase=null <<'PY'
 import json
@@ -199,6 +198,7 @@ install_commands_and_units() {
   local repository=$1
   install -d -m 0755 "$(rooted /usr/local/libexec)"
   install -m 0755 "$repository/deploy/compactdb-telegram-notifier.py" "$(rooted /usr/local/libexec/compactdb-telegram-notifier.py)"
+  install -m 0755 "$repository/deploy/compactdb-progress.py" "$(rooted /usr/local/libexec/compactdb-progress.py)"
   install -m 0755 "$repository/deploy/compactdb" "$(rooted /usr/local/bin/compactdb)"
   install -m 0755 "$repository/deploy/compactdb-notify" "$(rooted /usr/local/bin/compactdb-notify)"
   install -m 0755 "$repository/deploy/compactdb-observer" "$(rooted /usr/local/bin/compactdb-observer)"

@@ -109,6 +109,7 @@ for command in usr/local/bin/compactdb usr/local/sbin/compactdb-deploy; do
   [[ -x "$fake_root/$command" ]]
 done
 [[ -x "$fake_root/usr/local/libexec/compactdb-telegram-notifier.py" ]]
+[[ -x "$fake_root/usr/local/libexec/compactdb-progress.py" ]]
 for unit in compactdb-bot.service compactdb-deploy.service compactdb-notifier.service compactdb-notifier.timer; do
   [[ -f "$fake_root/etc/systemd/system/$unit" ]]
 done

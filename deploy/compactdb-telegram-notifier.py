@@ -20,7 +20,10 @@ DEPLOYMENT_STATE_PATH = Path("/var/lib/compactdb/deployment-state.json")
 NOTIFIER_STATE_PATH = Path("/var/lib/compactdb/notifier-state.json")
 TIMER_UNIT = "compactdb-notifier.timer"
 UPDATE_SECONDS = 300
+STALL_SECONDS = 600
 API_TIMEOUT_SECONDS = 15
+DOWNLOAD_PHASES = {"DOWNLOADING_GDOWN", "DOWNLOADING_RCLONE", "FALLING_BACK_TO_RCLONE"}
+ALERT_STATES = {"STALLED", "STOPPED", "FAILED", "RETRYING"}
 
 PHASE_LABELS = {
     "BOOTSTRAP_STARTED": "Bootstrap started",
@@ -137,6 +140,10 @@ def duration(seconds: Any) -> str:
     return " ".join(parts)
 
 
+def eta(value: Any) -> str:
+    return "UNKNOWN" if value is None or integer(value, -1) < 0 else duration(value)
+
+
 def parse_timestamp(value: Any) -> int:
     try:
         parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
@@ -164,7 +171,64 @@ def is_complete(deployment: dict[str, Any]) -> bool:
     return clean(deployment.get("current_phase"), "") == "COMPLETE"
 
 
-def progress_message(deployment: dict[str, Any], now: int, initial: bool = False) -> str:
+def sanitize_detail(value: Any) -> str:
+    text = clean(value, "Unknown failure")
+    text = re.sub(r"https?://\S+", "[redacted URL]", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"(?i)\b(bot_token|telegram_token|google_token|oauth_token|access_token|refresh_token|token|password|passwd|secret|authorization|cookie|oauth|client_secret)\b\s*[:=]\s*\S+",
+        r"\1=[redacted]",
+        text,
+    )
+    text = re.sub(r"(?i)bot\d{5,}:[A-Za-z0-9_-]+", "bot[redacted]", text)
+    return clean(text, "Unknown failure")
+
+
+def process_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def download_health(
+    deployment: dict[str, Any],
+    now: int,
+    process_checker: Callable[[int], bool] = process_exists,
+) -> str:
+    phase = clean(deployment.get("current_phase"), "")
+    process_state = clean(deployment.get("downloader_process_state"), "").upper()
+    if is_failed(deployment):
+        return "FAILED"
+    if phase not in DOWNLOAD_PHASES:
+        return "COMPLETE" if is_complete(deployment) else "IDLE"
+    if process_state == "FAILED":
+        return "FAILED"
+    if process_state == "RETRYING":
+        return "RETRYING"
+    if process_state in {"PREPARING", "EXITED_SUCCESS"}:
+        return process_state
+    pid = integer(deployment.get("downloader_pid"))
+    if not process_checker(pid):
+        return "STOPPED"
+    growth_epoch = parse_timestamp(deployment.get("last_successful_byte_growth_time"))
+    monitoring_epoch = parse_timestamp(deployment.get("download_monitoring_start_time"))
+    reference = growth_epoch or monitoring_epoch
+    if reference and now - reference >= STALL_SECONDS:
+        return "STALLED"
+    return "RUNNING"
+
+
+def progress_message(
+    deployment: dict[str, Any],
+    notifier_state: dict[str, Any],
+    now: int,
+    initial: bool = False,
+) -> str:
     title = "🚀 CompactDB VPS deployment started" if initial else "🚀 CompactDB VPS deployment in progress"
     swap_total = integer(deployment.get("swap_total"))
     swap_used = integer(deployment.get("swap_used"))
@@ -175,18 +239,24 @@ def progress_message(deployment: dict[str, Any], now: int, initial: bool = False
             f"VPS: {clean(deployment.get('hostname'), socket.gethostname())}",
             f"Started: {clean(deployment.get('deployment_start_time'))}",
             f"Phase: {phase_label(deployment)}",
+            f"Download method: {clean(deployment.get('downloader_name') or deployment.get('selected_download_method') or deployment.get('configured_download_method'))}",
+            f"Current file: {clean(deployment.get('current_file'), 'NONE')}",
+            f"Current file bytes: {human_bytes(deployment.get('current_file_bytes'))} / {human_bytes(deployment.get('current_file_expected_bytes'))}",
+            f"Files completed: {integer(deployment.get('completed_files'))} / {integer(deployment.get('remote_package_files'), 29)}",
+            f"Total bytes: {integer(deployment.get('downloaded_bytes'))} / {integer(deployment.get('total_bytes'))}",
             f"Progress: {percentage(deployment.get('percentage')):.1f}%",
-            f"Downloaded: {human_bytes(deployment.get('downloaded_bytes'))} / {human_bytes(deployment.get('total_bytes'))}",
-            f"Speed: {human_bytes(deployment.get('current_rate'))}/s current, {human_bytes(deployment.get('average_rate'))}/s average",
-            f"ETA: {duration(deployment.get('eta_seconds'))}",
-            f"Files: {integer(deployment.get('completed_files'))} / {integer(deployment.get('remote_package_files'))}",
-            f"Disk: {human_bytes(deployment.get('disk_total'))} total, {human_bytes(deployment.get('disk_free'))} free",
+            f"Current 60-second speed: {human_bytes(deployment.get('current_rate'))}/s",
+            f"Session average speed: {human_bytes(deployment.get('average_rate'))}/s",
+            f"ETA: {eta(deployment.get('eta_seconds'))}",
+            f"Last confirmed byte growth: {clean(deployment.get('last_successful_byte_growth_time'), 'NONE')}",
+            f"Downloader process: {clean(deployment.get('downloader_process_state'), 'UNKNOWN')} (PID {integer(deployment.get('downloader_pid'))})",
+            f"Disk free: {human_bytes(deployment.get('disk_free'))}",
             f"RAM available: {human_bytes(deployment.get('memory_available'))} / {human_bytes(deployment.get('memory_total'))}",
             f"Swap used: {human_bytes(swap_used)} / {human_bytes(swap_total)}",
             f"Elapsed: {duration(elapsed_seconds(deployment, now))}",
             f"Retries: {integer(deployment.get('retries'))}",
-            f"Download method: {clean(deployment.get('selected_download_method') or deployment.get('configured_download_method') or deployment.get('source_method'))}",
-            f"Bot service: {clean(deployment.get('bot_service_state'), 'inactive')}",
+            "Main bot: PENDING_DOWNLOAD",
+            f"Deployment notifier: {clean(notifier_state.get('delivery_status'), 'starting')}",
         )
     )
 
@@ -216,11 +286,30 @@ def failure_message(deployment: dict[str, Any]) -> str:
             "",
             f"Failed phase: {clean(deployment.get('failed_phase'), 'unknown')}",
             f"Error category: {category}",
+            f"Reason: {sanitize_detail(deployment.get('sanitized_error_detail'))}",
             f"Retry count: {integer(deployment.get('retries'))}",
             "Resumable: yes",
             "Command: compactdb repair",
         )
     )
+
+
+def alert_message(status_value: str, deployment: dict[str, Any]) -> str:
+    method = clean(deployment.get("downloader_name"), "unknown")
+    lines = [f"⚠️ CompactDB download {status_value}", f"Downloader: {method}"]
+    if status_value == "FAILED":
+        lines.extend(
+            (
+                f"Exit code: {integer(deployment.get('downloader_exit_code'), -1)}",
+                f"Reason: {sanitize_detail(deployment.get('sanitized_error_detail'))}",
+            )
+        )
+    elif status_value == "RETRYING":
+        lines.append(f"Retry count: {integer(deployment.get('retries'))}")
+    elif status_value == "RECOVERED":
+        lines.append("Confirmed package-byte growth has resumed.")
+    lines.append(f"Recovery action: {clean(deployment.get('recovery_action'), 'automatic resume/repair')}")
+    return "\n".join(lines)
 
 
 class TelegramAPI:
@@ -265,11 +354,13 @@ def should_deliver(deployment: dict[str, Any], state: dict[str, Any], now: int, 
     phase = clean(deployment.get("current_phase"), "BOOTSTRAP_STARTED")
     if phase != state.get("last_phase"):
         return True
-    if int(percentage(deployment.get("percentage"))) >= integer(state.get("last_percentage")) + 1:
+    if percentage(deployment.get("percentage")) >= percentage(state.get("last_percentage")) + 1.0:
         return True
     if integer(deployment.get("retries")) != integer(state.get("last_retries")):
         return True
     if clean(deployment.get("last_error_class"), "") != clean(state.get("last_error_class"), ""):
+        return True
+    if clean(deployment.get("downloader_process_state"), "") != clean(state.get("last_process_state"), ""):
         return True
     return now - integer(state.get("last_delivered_at")) >= UPDATE_SECONDS
 
@@ -287,7 +378,12 @@ def stop_timer() -> None:
         pass
 
 
-def deliver(force: bool = False, now: int | None = None, api_factory: Callable[[str], TelegramAPI] = TelegramAPI) -> bool:
+def deliver(
+    force: bool = False,
+    now: int | None = None,
+    api_factory: Callable[[str], TelegramAPI] = TelegramAPI,
+    process_checker: Callable[[int], bool] = process_exists,
+) -> bool:
     current_time = int(time.time()) if now is None else now
     deployment = load_json(DEPLOYMENT_STATE_PATH)
     notifier = load_json(NOTIFIER_STATE_PATH)
@@ -305,7 +401,46 @@ def deliver(force: bool = False, now: int | None = None, api_factory: Callable[[
         notifier["pending"] = True
         atomic_json(NOTIFIER_STATE_PATH, notifier)
         return False
-    if not should_deliver(deployment, notifier, current_time, force):
+
+    health = download_health(deployment, current_time, process_checker)
+    active_alert = clean(notifier.get("active_alert"), "")
+    pending_alert = notifier.get("pending_alert")
+    if not isinstance(pending_alert, dict):
+        pending_alert = {}
+    if is_complete(deployment):
+        pending_alert = {}
+        notifier["active_alert"] = ""
+        active_alert = ""
+    downloaded = integer(deployment.get("downloaded_bytes"))
+    if health in ALERT_STATES and health != active_alert:
+        pending_alert = {
+            "status": health,
+            "text": alert_message(health, deployment),
+            "created_at": current_time,
+            "downloaded_bytes": downloaded,
+            "delivered_chats": [],
+        }
+        notifier["active_alert"] = health
+        notifier["alert_downloaded_bytes"] = downloaded
+    elif (
+        active_alert in {"STALLED", "STOPPED", "FAILED", "RETRYING"}
+        and health == "RUNNING"
+        and downloaded > integer(notifier.get("alert_downloaded_bytes"))
+        and not pending_alert
+    ):
+        pending_alert = {
+            "status": "RECOVERED",
+            "text": alert_message("RECOVERED", deployment),
+            "created_at": current_time,
+            "downloaded_bytes": downloaded,
+            "delivered_chats": [],
+        }
+        notifier["active_alert"] = ""
+    notifier["download_health"] = health
+    notifier["pending_alert"] = pending_alert
+
+    alert_due = bool(pending_alert)
+    if not should_deliver(deployment, notifier, current_time, force or alert_due):
         notifier["delivery_status"] = "throttled"
         atomic_json(NOTIFIER_STATE_PATH, notifier)
         return True
@@ -320,7 +455,7 @@ def deliver(force: bool = False, now: int | None = None, api_factory: Callable[[
         if failed
         else success_message(deployment, current_time)
         if complete
-        else progress_message(deployment, current_time, initial=not bool(messages))
+        else progress_message(deployment, notifier, current_time, initial=not bool(messages))
     )
     api = api_factory(token)
     all_delivered = True
@@ -337,16 +472,36 @@ def deliver(force: bool = False, now: int | None = None, api_factory: Callable[[
                 messages[chat_id] = new_message_id
         all_delivered = all_delivered and delivered
 
+    if pending_alert:
+        delivered_chats = {
+            str(item) for item in pending_alert.get("delivered_chats", []) if str(item) in active_chats
+        }
+        for chat_id in chats:
+            if chat_id in delivered_chats:
+                continue
+            alert_text = str(pending_alert.get("text") or "CompactDB download alert")[:4000]
+            if api.send(chat_id, alert_text) is not None:
+                delivered_chats.add(chat_id)
+        pending_alert["delivered_chats"] = sorted(delivered_chats)
+        if delivered_chats == active_chats:
+            notifier["last_alert_status"] = clean(pending_alert.get("status"), "")
+            notifier["last_alert_delivered_at"] = current_time
+            pending_alert = {}
+        else:
+            all_delivered = False
+
     notifier["messages"] = messages
     notifier["message_count"] = len(messages)
-    notifier["pending"] = not all_delivered
+    notifier["pending_alert"] = pending_alert
+    notifier["pending"] = not all_delivered or bool(pending_alert)
     notifier["delivery_status"] = "delivered" if all_delivered else "queued_for_retry"
     if all_delivered:
         notifier["last_delivered_at"] = current_time
         notifier["last_phase"] = clean(deployment.get("current_phase"), "BOOTSTRAP_STARTED")
-        notifier["last_percentage"] = int(percentage(deployment.get("percentage")))
+        notifier["last_percentage"] = percentage(deployment.get("percentage"))
         notifier["last_retries"] = integer(deployment.get("retries"))
         notifier["last_error_class"] = clean(deployment.get("last_error_class"), "")
+        notifier["last_process_state"] = clean(deployment.get("downloader_process_state"), "")
         if complete:
             notifier["final_delivered"] = True
     atomic_json(NOTIFIER_STATE_PATH, notifier)
@@ -376,6 +531,8 @@ def status() -> None:
     print(f"Notifier last attempt: {integer(state.get('last_attempt_at'))}")
     print(f"Notifier last delivery: {integer(state.get('last_delivered_at'))}")
     print(f"Notifier final delivered: {'yes' if state.get('final_delivered') else 'no'}")
+    print(f"Download health: {clean(state.get('download_health'), 'unknown')}")
+    print(f"Active download alert: {clean(state.get('active_alert'), 'none')}")
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -84,6 +84,10 @@ class NotifierTests(unittest.TestCase):
             "retries": 0,
             "configured_download_method": "gdown",
             "bot_service_state": "inactive",
+            "downloader_name": "gdown",
+            "downloader_pid": 4242,
+            "downloader_process_state": "RUNNING",
+            "download_monitoring_start_time": "2026-08-01T00:00:00Z",
         }
         if self.deployment_path.exists():
             state.update(json.loads(self.deployment_path.read_text(encoding="utf-8")))
@@ -189,6 +193,7 @@ class NotifierTests(unittest.TestCase):
             retries=3,
             error_timestamp="2026-08-01T00:10:00Z",
             final_error_line="BOT_TOKEN=mock-secret owner=1001 private database row",
+            sanitized_error_detail="network failure BOT_TOKEN=mock-secret https://user:pass@example.invalid/path",
         )
         notifier.deliver(now=1785543000, api_factory=telegram)
         failure_text = [call for call in telegram.calls if call[0] == "edit"][-1][3]
@@ -196,6 +201,88 @@ class NotifierTests(unittest.TestCase):
         self.assertIn("compactdb repair", failure_text)
         self.assertNotIn("mock-secret", failure_text)
         self.assertNotIn("private database row", failure_text)
+        self.assertNotIn("user:pass", failure_text)
+        self.assertIn("network failure", failure_text)
+
+    def test_stalled_alert_after_ten_minutes(self) -> None:
+        telegram = MockTelegram()
+        self.write_deployment(
+            current_phase="DOWNLOADING_GDOWN",
+            last_successful_byte_growth_time="2026-08-01T00:00:00Z",
+        )
+        notifier.deliver(
+            now=1785543060,
+            api_factory=telegram,
+            process_checker=lambda _pid: True,
+        )
+        alerts = [call[2] for call in telegram.calls if call[0] == "send"]
+        self.assertTrue(any("download STALLED" in text for text in alerts))
+        self.assertEqual(self.state()["download_health"], "STALLED")
+
+    def test_stopped_alert_when_downloader_disappears(self) -> None:
+        telegram = MockTelegram()
+        self.write_deployment(current_phase="DOWNLOADING_GDOWN")
+        notifier.deliver(
+            now=1785542410,
+            api_factory=telegram,
+            process_checker=lambda _pid: False,
+        )
+        alerts = [call[2] for call in telegram.calls if call[0] == "send"]
+        self.assertTrue(any("download STOPPED" in text for text in alerts))
+
+    def test_recovered_alert_is_sent_once_after_growth(self) -> None:
+        telegram = MockTelegram()
+        self.write_deployment(
+            current_phase="DOWNLOADING_GDOWN",
+            downloaded_bytes=100,
+            percentage=10,
+            last_successful_byte_growth_time="2026-08-01T00:00:00Z",
+        )
+        notifier.deliver(now=1785543060, api_factory=telegram, process_checker=lambda _pid: True)
+        self.write_deployment(
+            downloaded_bytes=110,
+            percentage=11,
+            last_successful_byte_growth_time="2026-08-01T00:11:01Z",
+        )
+        notifier.deliver(now=1785543061, api_factory=telegram, process_checker=lambda _pid: True)
+        notifier.deliver(now=1785543062, api_factory=telegram, process_checker=lambda _pid: True)
+        alerts = [call[2] for call in telegram.calls if call[0] == "send"]
+        self.assertEqual(sum("download RECOVERED" in text for text in alerts), 1)
+
+    def test_retry_state_is_immediate_and_not_failed(self) -> None:
+        telegram = MockTelegram()
+        self.write_deployment(
+            current_phase="DOWNLOADING_GDOWN",
+            downloader_process_state="RETRYING",
+            retries=2,
+        )
+        notifier.deliver(now=1785542410, api_factory=telegram, process_checker=lambda _pid: False)
+        alerts = [call[2] for call in telegram.calls if call[0] == "send"]
+        self.assertTrue(any("download RETRYING" in text for text in alerts))
+        self.assertFalse(any("download FAILED" in text for text in alerts))
+
+    def test_download_display_is_telemetry_bound_and_bot_pending(self) -> None:
+        telegram = MockTelegram()
+        self.write_deployment(
+            current_phase="DOWNLOADING_RCLONE",
+            downloader_name="rclone",
+            current_file="segment-07.duckdb.partial",
+            current_file_bytes=123,
+            current_file_expected_bytes=1000,
+            downloaded_bytes=456,
+            total_bytes=220754442143,
+            current_rate=0,
+            eta_seconds=None,
+            last_successful_byte_growth_time="2026-08-01T00:01:00Z",
+        )
+        notifier.deliver(now=1785542470, api_factory=telegram, process_checker=lambda _pid: True)
+        progress = [call[2] for call in telegram.calls if call[0] == "send"][0]
+        self.assertIn("Current file: segment-07.duckdb.partial", progress)
+        self.assertIn("Total bytes: 456 / 220754442143", progress)
+        self.assertIn("Current 60-second speed: 0 B/s", progress)
+        self.assertIn("ETA: UNKNOWN", progress)
+        self.assertIn("Main bot: PENDING_DOWNLOAD", progress)
+        self.assertNotIn("Main bot: unhealthy", progress)
 
     def test_deployment_entrypoint_never_fails_for_telegram(self) -> None:
         with mock.patch.object(notifier, "deliver", return_value=False):

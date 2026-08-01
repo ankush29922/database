@@ -9,6 +9,9 @@ SOURCE=/opt/compactdb/repository
 LOG=/var/log/compactdb/deploy.log
 DEPLOY_CONFIG=/etc/compactdb/deploy.env
 BOT_CONFIG=/etc/compactdb/bot.env
+REMOTE_MANIFEST=/var/lib/compactdb/remote-manifest.json
+PROGRESS_HISTORY=/var/lib/compactdb/progress-accounting.json
+PROGRESS_COLLECTOR=/usr/local/libexec/compactdb-progress.py
 EXPECTED_FILES=29
 EXPECTED_BYTES=220754442143
 EXPECTED_FINAL_BYTES=188926144512
@@ -93,6 +96,9 @@ sanitize_line() {
     tr '\r\n\t' '   ' |
     sed -E \
       -e 's#https?://[^ ]+#[REDACTED_URL]#g' \
+      -e 's/([A-Za-z_]*[Tt][Oo][Kk][Ee][Nn][A-Za-z_]*)=[^ ]+/\1=[REDACTED]/g' \
+      -e 's/([A-Za-z_]*[Ss][Ee][Cc][Rr][Ee][Tt][A-Za-z_]*)=[^ ]+/\1=[REDACTED]/g' \
+      -e 's/([A-Za-z_]*[Pp][Aa][Ss][Ss]([Ww][Oo][Rr][Dd]|[Ww][Dd])?[A-Za-z_]*)=[^ ]+/\1=[REDACTED]/g' \
       -e 's/([Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Uu][Rr][Ll])=[^ ]+/\1=[REDACTED]/g' \
       -e 's/[0-9]{6,}:[A-Za-z0-9_-]{20,}/[REDACTED_TOKEN]/g' \
       -e 's/[0-9]{8,}/[REDACTED_NUMBER]/g' |
@@ -107,10 +113,38 @@ sanitize_command() {
   printf '%s' "${value:-unknown}"
 }
 
+classify_error_detail() {
+  local code=$1 line lower safe
+  line=${2:-command returned a nonzero exit status}
+  safe=$(sanitize_line "$line")
+  lower=${safe,,}
+  if (( code == 137 )); then
+    printf 'Process killed by OOM'
+  elif [[ "$lower" == *authentication* || "$lower" == *'not authenticated'* || "$lower" == *'login required'* ]]; then
+    printf 'Google authentication required or expired'
+  elif [[ "$lower" == *quota* || "$lower" == *'rate limit'* || "$lower" == *'too many requests'* ]]; then
+    printf 'Google Drive quota or rate limit'
+  elif [[ "$lower" == *'permission denied'* || "$lower" == *forbidden* ]]; then
+    printf 'File permission denied'
+  elif [[ "$lower" == *'no space left'* || "$lower" == *'insufficient space'* ]]; then
+    printf 'Insufficient disk space'
+  elif [[ "$lower" == *'could not resolve'* || "$lower" == *dns* || "$lower" == *tls* || "$lower" == *network* || "$lower" == *timeout* ]]; then
+    printf 'Network, DNS, or TLS failure'
+  elif [[ "$lower" == *'unknown flag'* || "$lower" == *'unknown option'* || "$lower" == *'unrecognized option'* ]]; then
+    printf 'Unsupported command option'
+  elif [[ "$lower" == *'no such file'* || "$lower" == *'not found'* || "$lower" == *'missing executable'* ]]; then
+    printf 'Missing executable or virtual environment'
+  else
+    printf '%s process exited with exit code %d: %s' "${CURRENT_DOWNLOADER:-downloader}" "$code" "$safe"
+  fi
+}
+
 CURRENT_PHASE=INITIALIZING
 CURRENT_ERROR_CLASS=APPLICATION_INSTALL_FAILED
 LAST_ERROR_LINE='command returned a nonzero exit status'
 ERROR_RECORDED=0
+CURRENT_DOWNLOADER=none
+DOWNLOADER_PROCESS_STATE=PREPARING
 
 record_failure() {
   local code=$1 class=$2 command_name=$3 error_line=$4 failed_phase=${5:-$CURRENT_PHASE}
@@ -121,15 +155,19 @@ record_failure() {
   when=$(date -u +%FT%TZ)
   command_name=$(sanitize_command "$command_name")
   error_line=$(sanitize_line "$error_line")
+  error_line=$(classify_error_detail "$code" "$error_line")
   retries=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("retries",0)))' "$STATE" 2>/dev/null || printf 0)
   resource_snapshot
   state current_phase=DEPLOYMENT_FAILED failed_phase="$failed_phase" last_error_class="$class" \
     failing_command="$command_name" exit_code="$code" final_error_line="$error_line" \
-    error_timestamp="$when" retries="$((retries + 1))" \
+    error_timestamp="$when" retries="$retries" \
     disk_free="$disk_free_current" memory_total="$memory_total_current" \
     memory_available="$memory_available_current" swap_total="$swap_total_current" \
     swap_used="$swap_used_current" \
-    bot_service_state="$(systemctl is-active compactdb-bot.service 2>/dev/null || true)"
+    bot_service_state="$(systemctl is-active compactdb-bot.service 2>/dev/null || true)" \
+    downloader_name="$CURRENT_DOWNLOADER" downloader_pid="${transfer_pid:-0}" \
+    downloader_process_state=FAILED downloader_exit_code="$code" \
+    sanitized_error_detail="$error_line" recovery_action='compactdb repair'
   safe_log "phase=$failed_phase error_class=$class command=$command_name exit=$code error=$error_line"
 }
 
@@ -180,7 +218,8 @@ fi
 metadata_snapshot() {
   local path
   read -r local_files local_bytes < <(
-    find "$PACKAGE" -type f -printf '%s\n' 2>/dev/null |
+    find "$PACKAGE" -type f ! -name '*.part' ! -name '*.partial' ! -name '*.tmp' \
+      ! -name '*.download' ! -name '*.crdownload' -printf '%s\n' 2>/dev/null |
       awk '{count++; bytes += $1} END {printf "%d %.0f\n", count, bytes}'
   )
   path="$PACKAGE/database/compactdb-final.duckdb"
@@ -270,25 +309,32 @@ else
   swap_used=$((swap_total - swap_free))
   existing=$local_bytes
 
-  if [[ "$transfer_plan" == rclone || "$transfer_plan" == gdown_then_rclone ]]; then
+  if [[ "$rclone_configured" == yes ]]; then
     CURRENT_ERROR_CLASS=RCLONE_TRANSFER_FAILED
-    size_output=$(mktemp /run/compactdb-rclone-size.XXXXXX)
+    manifest_output=$(mktemp /run/compactdb-rclone-manifest.XXXXXX)
     set +e
-    rclone size --config /etc/compactdb/rclone.conf --json "$RCLONE_REMOTE_SOURCE" >"$size_output" 2>/dev/null
-    size_code=$?
+    rclone lsjson --config /etc/compactdb/rclone.conf --recursive --files-only \
+      "$RCLONE_REMOTE_SOURCE" >"$manifest_output" 2>/dev/null
+    manifest_code=$?
     set -e
-    if (( size_code != 0 )); then
-      rm -f -- "$size_output"
-      fail "$size_code" RCLONE_TRANSFER_FAILED rclone 'remote package metadata request failed' 1
+    if (( manifest_code != 0 )); then
+      rm -f -- "$manifest_output"
+      fail "$manifest_code" RCLONE_TRANSFER_FAILED rclone 'remote package manifest request failed' 1
     fi
-    remote_bytes=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["bytes"]))' "$size_output")
-    remote_files=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["count"]))' "$size_output")
-    rm -f -- "$size_output"
+    set +e
+    manifest_summary=$("$PROGRESS_COLLECTOR" manifest --input "$manifest_output" \
+      --output "$REMOTE_MANIFEST" --expected-files "$EXPECTED_FILES" \
+      --expected-bytes "$EXPECTED_BYTES" 2>/dev/null)
+    manifest_code=$?
+    set -e
+    rm -f -- "$manifest_output"
+    (( manifest_code == 0 )) ||
+      fail "$manifest_code" PACKAGE_METADATA_INCOMPLETE remote-manifest \
+        'remote package manifest differs from the audited 29-file package' 20
+    read -r remote_files remote_bytes <<<"$manifest_summary"
   else
-    remote_bytes=${REMOTE_PACKAGE_BYTES:-$EXPECTED_BYTES}
-    remote_files=${REMOTE_PACKAGE_FILES:-$EXPECTED_FILES}
-    [[ "$remote_bytes" =~ ^[0-9]+$ && "$remote_files" =~ ^[0-9]+$ ]] ||
-      fail 20 CONFIGURATION_MISSING deploy.env 'gdown package metadata must be numeric' 20
+    fail 20 CONFIGURATION_MISSING remote-manifest \
+      'rclone metadata access is required for authoritative progress accounting' 20
   fi
 
   remaining=$((remote_bytes - existing))
@@ -298,56 +344,42 @@ else
     filesystem_type="$fs_type" disk_total="$disk_total" disk_free="$disk_free" \
     memory_total="$memory_total" memory_available="$memory_available" swap_total="$swap_total" \
     swap_used="$swap_used" final_free_floor="$FLOOR" \
-    runtime_allowance="$ALLOWANCE" downloaded_bytes="$existing"
+    runtime_allowance="$ALLOWANCE"
   if (( disk_free < required )); then
     fail 20 CONFIGURATION_MISSING storage-preflight 'the configured disk floor cannot be maintained' 20
   fi
 
-  inventory=$(mktemp /run/compactdb-inventory.XXXXXX)
-  find "$PACKAGE" -type f ! -name '*.partial' ! -name '*.tmp' -printf '%P\t%s\n' | sort >"$inventory"
-  initial_bytes=$existing
-  initial_files=$local_files
-  transfer_started_epoch=$(date +%s)
-  previous_epoch=$transfer_started_epoch
-  network_interface=$(ip route show default | awk 'NR==1{print $5}')
-  previous_rx=$(cat "/sys/class/net/$network_interface/statistics/rx_bytes")
-
   progress_snapshot() {
-    local snapshot now elapsed rx net_rate persistent_bytes persistent_files counts skipped transferred pct eta average
-    snapshot=$(mktemp /run/compactdb-progress.XXXXXX)
-    find "$PACKAGE" -type f ! -name '*.partial' ! -name '*.tmp' -printf '%P\t%s\n' | sort >"$snapshot"
-    read -r persistent_files persistent_bytes < <(awk '{count++; bytes += $NF} END {printf "%d %.0f\n", count, bytes}' "$snapshot")
-    read -r skipped transferred < <(
-      awk -F '\t' 'NR==FNR{before[$1]=$2; next} {if (($1 in before) && before[$1]==$2) skipped++; else transferred++} END{printf "%d %d\n", skipped, transferred}' "$inventory" "$snapshot"
-    )
-    now=$(date +%s)
-    elapsed=$((now - previous_epoch)); (( elapsed < 1 )) && elapsed=1
-    rx=$(cat "/sys/class/net/$network_interface/statistics/rx_bytes")
-    net_rate=$(((rx - previous_rx) / elapsed)); (( net_rate < 0 )) && net_rate=0
-    average=$(((persistent_bytes - initial_bytes) / (now - transfer_started_epoch + 1))); (( average < 0 )) && average=0
-    pct=$(awk -v value="$persistent_bytes" -v all="$remote_bytes" 'BEGIN{p=100*value/(all>0?all:1); if(p<0)p=0; if(p>100)p=100; printf "%.4f",p}')
-    if (( net_rate > 0 && remote_bytes > persistent_bytes )); then eta=$(((remote_bytes-persistent_bytes)/net_rate)); else eta=0; fi
+    local collector_code
+    set +e
+    "$PROGRESS_COLLECTOR" snapshot --package "$PACKAGE" --manifest "$REMOTE_MANIFEST" \
+      --history "$PROGRESS_HISTORY" --state "$STATE" --downloader "$CURRENT_DOWNLOADER" \
+      --pid "${transfer_pid:-0}" --process-state "$DOWNLOADER_PROCESS_STATE"
+    collector_code=$?
+    set -e
+    if (( collector_code != 0 )); then
+      safe_log "phase=telemetry error_class=PROGRESS_ACCOUNTING_FAILED exit=$collector_code"
+      return 0
+    fi
     resource_snapshot
-    state current_phase="$CURRENT_PHASE" downloaded_bytes="$persistent_bytes" percentage="$pct" \
-      current_rate="$net_rate" average_rate="$average" network_receive_rate="$net_rate" \
-      eta_seconds="$eta" completed_files="$persistent_files" total_local_files="$persistent_files" \
-      transferred_files="$transferred" skipped_files="$skipped" last_progress_timestamp="$(date -u +%FT%TZ)" \
+    state current_phase="$CURRENT_PHASE" \
       disk_free="$disk_free_current" memory_total="$memory_total_current" \
       memory_available="$memory_available_current" swap_total="$swap_total_current" \
       swap_used="$swap_used_current"
-    previous_epoch=$now
-    previous_rx=$rx
-    rm -f -- "$snapshot"
   }
 
   run_rclone() {
     CURRENT_PHASE=DOWNLOADING_RCLONE
     CURRENT_ERROR_CLASS=RCLONE_TRANSFER_FAILED
+    CURRENT_DOWNLOADER=rclone
+    DOWNLOADER_PROCESS_STATE=RUNNING
     state current_phase=DOWNLOADING_RCLONE selected_download_method=rclone \
       performance_profile="$profile" transfer_count=1 stream_count="$streams"
+    transfer_output=$(mktemp /run/compactdb-rclone-transfer.XXXXXX)
     compactdb_rclone_copy "$RCLONE_REMOTE_SOURCE" "$PACKAGE" \
-      /etc/compactdb/rclone.conf "$streams" >/dev/null 2>&1 &
+      /etc/compactdb/rclone.conf "$streams" >"$transfer_output" 2>&1 &
     transfer_pid=$!
+    progress_snapshot
     while kill -0 "$transfer_pid" 2>/dev/null; do
       sleep 15 & wait $!
       progress_snapshot
@@ -356,12 +388,22 @@ else
     wait "$transfer_pid"
     transfer_code=$?
     set -e
-    (( transfer_code == 0 )) || fail "$transfer_code" RCLONE_TRANSFER_FAILED rclone 'rclone transfer failed after its configured retries' 1
+    LAST_ERROR_LINE=$(awk 'NF{line=$0} END{print line}' "$transfer_output")
+    rm -f -- "$transfer_output"
+    if (( transfer_code == 0 )); then
+      DOWNLOADER_PROCESS_STATE=EXITED_SUCCESS
+      progress_snapshot
+      return 0
+    fi
+    DOWNLOADER_PROCESS_STATE=FAILED
+    fail "$transfer_code" RCLONE_TRANSFER_FAILED rclone \
+      "${LAST_ERROR_LINE:-rclone transfer failed after its configured retries}" 1
   }
 
   run_gdown() {
     CURRENT_PHASE=DOWNLOADING_GDOWN
     CURRENT_ERROR_CLASS=GDOWN_TRANSFER_FAILED
+    CURRENT_DOWNLOADER=gdown
     state current_phase=DOWNLOADING_GDOWN selected_download_method=gdown
     if [[ ! -x /opt/compactdb/deploy-venv/bin/python ]]; then
       run_quiet GDOWN_TRANSFER_FAILED python3 1 python3 -m venv /opt/compactdb/deploy-venv
@@ -374,16 +416,31 @@ else
     fi
     local attempt=1
     while (( attempt <= 5 )); do
+      DOWNLOADER_PROCESS_STATE=RUNNING
+      transfer_output=$(mktemp /run/compactdb-gdown-transfer.XXXXXX)
       compactdb_gdown_folder /opt/compactdb/deploy-venv/bin/gdown \
-        "$GDRIVE_URL" "$PACKAGE" >/dev/null 2>&1 &
+        "$GDRIVE_URL" "$PACKAGE" >"$transfer_output" 2>&1 &
       transfer_pid=$!
+      progress_snapshot
       while kill -0 "$transfer_pid" 2>/dev/null; do sleep 15 & wait $!; progress_snapshot; done
       set +e
       wait "$transfer_pid"
       transfer_code=$?
       set -e
-      (( transfer_code == 0 )) && return 0
-      state retries="$attempt" last_error_class=GDOWN_TRANSFER_FAILED
+      LAST_ERROR_LINE=$(awk 'NF{line=$0} END{print line}' "$transfer_output")
+      rm -f -- "$transfer_output"
+      if (( transfer_code == 0 )); then
+        DOWNLOADER_PROCESS_STATE=EXITED_SUCCESS
+        progress_snapshot
+        return 0
+      fi
+      DOWNLOADER_PROCESS_STATE=RETRYING
+      state retries="$attempt" last_error_class=GDOWN_TRANSFER_FAILED \
+        downloader_name=gdown downloader_pid="$transfer_pid" downloader_exit_code="$transfer_code" \
+        downloader_process_state=RETRYING \
+        sanitized_error_detail="$(classify_error_detail "$transfer_code" "${LAST_ERROR_LINE:-gdown process failed}")" \
+        recovery_action='automatic retry with rclone fallback available'
+      progress_snapshot
       attempt=$((attempt + 1))
       sleep 30
     done
@@ -401,13 +458,22 @@ else
     run_rclone
   }
 
+  transfer_pid=0
+  DOWNLOADER_PROCESS_STATE=PREPARING
+  if [[ "$transfer_plan" == rclone ]]; then
+    CURRENT_DOWNLOADER=rclone
+  else
+    CURRENT_DOWNLOADER=gdown
+  fi
+  progress_snapshot
   safe_log "phase=download method=$transfer_plan remote_bytes=$remote_bytes remote_files=$remote_files"
   case "$transfer_plan" in
     rclone)
       run_rclone
       ;;
     gdown)
-      run_gdown || fail "$?" GDOWN_TRANSFER_FAILED gdown 'gdown transfer failed after its configured retries' 1
+      run_gdown || fail "$?" GDOWN_TRANSFER_FAILED gdown \
+        "${LAST_ERROR_LINE:-gdown transfer failed after its configured retries}" 1
       ;;
     gdown_then_rclone)
       compactdb_gdown_with_rclone_fallback \
@@ -415,8 +481,6 @@ else
       state selected_download_method="$COMPACTDB_SELECTED_DOWNLOAD_METHOD"
       ;;
   esac
-  rm -f -- "$inventory"
-
   metadata_snapshot
   if ! metadata_is_exact; then
     CURRENT_PHASE=PACKAGE_METADATA_RECONCILIATION

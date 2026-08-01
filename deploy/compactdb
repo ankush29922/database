@@ -29,7 +29,9 @@ dashboard() {
   total_files=$(field remote_package_files)
   bytes=$(field downloaded_bytes)
   total_bytes=$(field total_bytes)
-  if "$OBSERVER" compactdb-bot.service >/dev/null 2>&1; then
+  if [[ "$phase" != COMPLETE ]]; then
+    bot=PENDING_DOWNLOAD
+  elif "$OBSERVER" compactdb-bot.service >/dev/null 2>&1; then
     bot=healthy
   else
     bot=unhealthy
@@ -50,6 +52,12 @@ dashboard() {
     printf 'Current rate: %s B/s\n' "$(field current_rate)"
     printf 'Average rate: %s B/s\n' "$(field average_rate)"
     printf 'ETA seconds: %s\n' "$(field eta_seconds)"
+    printf 'Download method: %s\n' "$(field downloader_name)"
+    printf 'Current file: %s (%s/%s bytes)\n' "$(field current_file)" \
+      "$(field current_file_bytes)" "$(field current_file_expected_bytes)"
+    printf 'Last byte growth: %s\n' "$(field last_successful_byte_growth_time)"
+    printf 'Downloader process: %s (PID %s)\n' "$(field downloader_process_state)" \
+      "$(field downloader_pid)"
     printf 'Last error: %s\n' "$(field last_error_class)"
   fi
   if [[ -x "$NOTIFIER" ]]; then
@@ -66,7 +74,11 @@ case "$command" in
   status)
     need_root status "$@"
     dashboard
-    "$OBSERVER" compactdb-bot.service || true
+    if [[ $(field current_phase) == COMPLETE ]]; then
+      "$OBSERVER" compactdb-bot.service || true
+    else
+      printf 'Bot service check: PENDING_DOWNLOAD\n'
+    fi
     printf 'Deploy service: %s\n' "$(systemctl is-active compactdb-deploy.service 2>/dev/null || true)"
     printf 'App revision: %s\n' "$(field application_revision)"
     ;;
