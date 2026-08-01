@@ -3,6 +3,7 @@ set -euo pipefail
 
 STATE=${COMPACTDB_STATE_PATH:-/var/lib/compactdb/deployment-state.json}
 OBSERVER=${COMPACTDB_OBSERVER_COMMAND:-/usr/local/bin/compactdb-observer}
+NOTIFIER=${COMPACTDB_NOTIFIER_COMMAND:-/usr/local/libexec/compactdb-telegram-notifier.py}
 
 need_root() {
   if [[ $EUID -ne 0 ]]; then
@@ -51,6 +52,11 @@ dashboard() {
     printf 'ETA seconds: %s\n' "$(field eta_seconds)"
     printf 'Last error: %s\n' "$(field last_error_class)"
   fi
+  if [[ -x "$NOTIFIER" ]]; then
+    "$NOTIFIER" status
+  else
+    printf 'Notifier delivery: unavailable\n'
+  fi
 }
 
 command=${1:-status}
@@ -80,7 +86,15 @@ case "$command" in
     ;;
   logs)
     need_root logs "$@"
-    journalctl -u compactdb-deploy.service -u compactdb-bot.service -u compactdb-update.service --no-pager -n 150 -o short-iso
+    journalctl -u compactdb-deploy.service -u compactdb-bot.service -u compactdb-notifier.service -u compactdb-update.service --no-pager -n 150 -o short-iso
+    ;;
+  notify-status)
+    need_root notify-status "$@"
+    "$NOTIFIER" status
+    ;;
+  notify-test)
+    need_root notify-test "$@"
+    "$NOTIFIER" test
     ;;
   start|stop|restart)
     need_root "$command" "$@"
@@ -114,7 +128,7 @@ case "$command" in
     systemctl restart compactdb-bot.service
     ;;
   *)
-    printf '%s\n' 'Usage: compactdb {progress|status|logs|restart|stop|repair|start|update|rollback}' >&2
+    printf '%s\n' 'Usage: compactdb {progress|status|notify-status|notify-test|logs|restart|stop|repair|start|update|rollback}' >&2
     exit 2
     ;;
 esac

@@ -25,6 +25,10 @@ watchdog, bounded automatic restart/backoff, notification retry, and optional
 authenticated private-repository update timer. It then starts the durable
 deployment unit and displays `compactdb progress`. Ctrl+C only detaches the
 display; systemd continues the deployment.
+The standard-library Telegram notifier starts before the database transfer,
+edits one durable progress message, and retries from systemd after terminal
+closure, reboot, network loss, or Telegram API timeout. Notifier state is shown
+by both `compactdb progress` and `compactdb status`.
 The database package is downloaded directly from the configured private Google
 Drive remote and is never stored in this repository.
 
@@ -32,12 +36,17 @@ Operational commands:
 
 ```bash
 sudo compactdb status
+sudo compactdb notify-status
+sudo compactdb notify-test
 sudo compactdb-observer
 sudo compactdb logs
 sudo compactdb restart
 sudo compactdb stop
 sudo compactdb repair
 ```
+
+`compactdb notify-test` is the only command that sends a standalone test
+message. The installer never invokes it.
 
 `compactdb-observer` reads `ActiveState`, `SubState`, and `MainPID` from systemd.
 Healthy means active, running, and a nonzero MainPID. It also checks for the

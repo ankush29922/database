@@ -47,8 +47,10 @@ bootstrap_mode() {
   [[ ${!BOOTSTRAP_GUARD:-0} != 1 ]] || die 'bootstrap recursion guard triggered'
   printf 'COMPACTDB_INSTALL_MODE=bootstrap\n'
   export DEBIAN_FRONTEND=noninteractive
+  local deployment_started
+  deployment_started=$(date -u +%FT%TZ)
   apt-get update -qq || die 'failed to refresh Ubuntu package metadata'
-  apt-get install -y -qq ca-certificates curl git >/dev/null || die 'failed to install bootstrap prerequisites: ca-certificates curl git'
+  apt-get install -y -qq ca-certificates curl git python3 >/dev/null || die 'failed to install bootstrap prerequisites: ca-certificates curl git python3'
 
   local temporary checkout status
   temporary=$(mktemp -d /tmp/compactdb-bootstrap.XXXXXX)
@@ -61,6 +63,7 @@ bootstrap_mode() {
   set +e
   COMPACTDB_BOOTSTRAP_ACTIVE=1 \
   COMPACTDB_REPOSITORY_MODE=1 \
+  COMPACTDB_DEPLOYMENT_START_TIME="$deployment_started" \
     bash "$checkout/deploy/install.sh"
   status=$?
   set -e
@@ -69,6 +72,60 @@ bootstrap_mode() {
   trap - EXIT
   (( status == 0 )) || printf 'CompactDB repository installer exited with status %d. Re-run the same command after correcting the reported error.\n' "$status" >&2
   return "$status"
+}
+
+installer_phase() {
+  local phase=$1 started=$2 state_path package method disk_total disk_free memory_total memory_available swap_total swap_free swap_used
+  state_path=$(rooted /var/lib/compactdb/deployment-state.json)
+  package=$(rooted /srv/compactdb/CompactDB-Portable)
+  method=$(bash -c 'set -u; source "$1" >/dev/null 2>&1; printf "%s" "${DOWNLOAD_METHOD:-auto}"' \
+    _ "$(rooted /etc/compactdb/deploy.env)" 2>/dev/null || printf auto)
+  read -r disk_total disk_free < <(df -B1 --output=size,avail "$package" | awk 'NR==2{print $1,$2}')
+  memory_total=$(awk '/MemTotal:/{print $2*1024}' /proc/meminfo)
+  memory_available=$(awk '/MemAvailable:/{print $2*1024}' /proc/meminfo)
+  swap_total=$(awk '/SwapTotal:/{print $2*1024}' /proc/meminfo)
+  swap_free=$(awk '/SwapFree:/{print $2*1024}' /proc/meminfo)
+  swap_used=$((swap_total - swap_free))
+  python3 - "$state_path" \
+    current_phase="$phase" deployment_start_time="$started" hostname="$(hostname)" \
+    configured_download_method="$method" percentage=0 downloaded_bytes=0 total_bytes=0 \
+    current_rate=0 average_rate=0 eta_seconds=0 completed_files=0 remote_package_files=0 \
+    retries=0 disk_total="$disk_total" disk_free="$disk_free" memory_total="$memory_total" \
+    memory_available="$memory_available" swap_total="$swap_total" swap_used="$swap_used" \
+    bot_service_state=inactive last_error_class=null error_timestamp=null failed_phase=null <<'PY'
+import json
+import os
+import sys
+import time
+
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as stream:
+        data = json.load(stream)
+except Exception:
+    data = {}
+for item in sys.argv[2:]:
+    key, raw = item.split("=", 1)
+    if raw == "null":
+        value = None
+    else:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = raw
+    data[key] = value
+data["last_state_update"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+temporary = f"{path}.tmp.{os.getpid()}"
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(temporary, "w", encoding="utf-8") as stream:
+    json.dump(data, stream, sort_keys=True, separators=(",", ":"))
+    stream.write("\n")
+    stream.flush()
+    os.fsync(stream.fileno())
+os.chmod(temporary, 0o600)
+os.replace(temporary, path)
+PY
+  systemctl start --no-block compactdb-notifier.service >/dev/null 2>&1 || true
 }
 
 ensure_swap() {
@@ -118,6 +175,8 @@ ensure_venv() {
 
 install_commands_and_units() {
   local repository=$1
+  install -d -m 0755 "$(rooted /usr/local/libexec)"
+  install -m 0755 "$repository/deploy/compactdb-telegram-notifier.py" "$(rooted /usr/local/libexec/compactdb-telegram-notifier.py)"
   install -m 0755 "$repository/deploy/compactdb" "$(rooted /usr/local/bin/compactdb)"
   install -m 0755 "$repository/deploy/compactdb-notify" "$(rooted /usr/local/bin/compactdb-notify)"
   install -m 0755 "$repository/deploy/compactdb-observer" "$(rooted /usr/local/bin/compactdb-observer)"
@@ -127,14 +186,16 @@ install_commands_and_units() {
   install -m 0644 "$repository/deploy/compactdb-deploy.service" "$(rooted /etc/systemd/system/compactdb-deploy.service)"
   install -m 0644 "$repository/deploy/compactdb-update.service" "$(rooted /etc/systemd/system/compactdb-update.service)"
   install -m 0644 "$repository/deploy/compactdb-update.timer" "$(rooted /etc/systemd/system/compactdb-update.timer)"
-  install -m 0644 "$repository/deploy/compactdb-notify.service" "$(rooted /etc/systemd/system/compactdb-notify.service)"
-  install -m 0644 "$repository/deploy/compactdb-notify.timer" "$(rooted /etc/systemd/system/compactdb-notify.timer)"
+  install -m 0644 "$repository/deploy/compactdb-notifier.service" "$(rooted /etc/systemd/system/compactdb-notifier.service)"
+  install -m 0644 "$repository/deploy/compactdb-notifier.timer" "$(rooted /etc/systemd/system/compactdb-notifier.timer)"
 }
 
 configure_systemd() {
   systemctl daemon-reload
-  systemctl enable compactdb-deploy.service compactdb-bot.service compactdb-notify.timer >/dev/null
-  systemctl start compactdb-notify.timer
+  systemctl disable --now compactdb-notify.timer >/dev/null 2>&1 || true
+  systemctl enable compactdb-deploy.service compactdb-bot.service compactdb-notifier.timer >/dev/null
+  systemctl start compactdb-notifier.timer
+  systemctl start --no-block compactdb-notifier.service >/dev/null 2>&1 || true
 
   if ! bash -c 'set -u; source "$1" >/dev/null 2>&1; [[ -n ${GITHUB_TOKEN:-} ]]' \
       _ "$(rooted /etc/compactdb/update.env)"; then
@@ -150,45 +211,50 @@ configure_systemd() {
 }
 
 repository_mode() {
-  local project_dir repository repair_only
+  local project_dir repository repair_only deployment_started
   project_dir=$1
   repair_only=${COMPACTDB_REPAIR_ONLY:-0}
+  deployment_started=${COMPACTDB_DEPLOYMENT_START_TIME:-$(date -u +%FT%TZ)}
   printf 'COMPACTDB_INSTALL_MODE=repository\n'
   [[ ${COMPACTDB_INSTALL_TEST_STOP_AFTER_MODE:-0} != 1 ]] || return 0
 
   # shellcheck source=install-lib.sh
   source "$project_dir/deploy/install-lib.sh"
 
-  export DEBIAN_FRONTEND=noninteractive
-  if [[ "$repair_only" != 1 ]]; then
-    apt-get update -qq
-    apt-get install -y -qq \
-      ca-certificates curl git jq python3 python3-pip python3-venv rclone \
-      util-linux coreutils tar logrotate >/dev/null
-  fi
-
   if ! id compactdb >/dev/null 2>&1; then
     useradd --system --home-dir /var/lib/compactdb --shell /usr/sbin/nologin --user-group compactdb
   fi
-  install -d -o root -g root -m 0755 "$(rooted /opt/compactdb)" "$(rooted /opt/compactdb/releases)" "$(rooted /usr/local/bin)" "$(rooted /usr/local/sbin)" "$(rooted /etc/systemd/system)"
+  install -d -o root -g root -m 0755 "$(rooted /opt/compactdb)" "$(rooted /opt/compactdb/releases)" "$(rooted /usr/local/bin)" "$(rooted /usr/local/sbin)" "$(rooted /usr/local/libexec)" "$(rooted /etc/systemd/system)"
   install -d -o root -g compactdb -m 0750 "$(rooted /srv/compactdb)" "$(rooted /srv/compactdb/CompactDB-Portable)" "$(rooted /srv/compactdb/CompactDB-Portable/database)"
   install -d -o root -g compactdb -m 0750 "$(rooted /var/lib/compactdb)" "$(rooted /var/log/compactdb)"
   install -d -o root -g root -m 0700 "$(rooted /etc/compactdb)"
   install -d -o compactdb -g compactdb -m 0700 "$(rooted /var/lib/compactdb/runtime)" "$(rooted /var/lib/compactdb/duckdb-temp)"
 
+  repository=$(rooted /opt/compactdb/repository)
+  compactdb_sync_repository "$project_dir" "$repository"
+  compactdb_install_private_configuration "$project_dir/private" "$(rooted /etc/compactdb)"
+  install_commands_and_units "$repository"
+  systemctl daemon-reload
+  systemctl enable compactdb-notifier.timer >/dev/null
+  systemctl start compactdb-notifier.timer
+  installer_phase BOOTSTRAP_STARTED "$deployment_started"
+
+  export DEBIAN_FRONTEND=noninteractive
   if [[ "$repair_only" != 1 ]]; then
+    installer_phase INSTALLING_PREREQUISITES "$deployment_started"
+    apt-get update -qq
+    apt-get install -y -qq \
+      ca-certificates curl git jq python3 python3-pip python3-venv rclone \
+      util-linux coreutils tar logrotate >/dev/null
+    installer_phase CONFIGURING_SWAP "$deployment_started"
     ensure_swap
     install -d -m 0755 "$(rooted /etc/sysctl.d)"
     printf 'vm.swappiness=10\n' >"$(rooted /etc/sysctl.d/90-compactdb.conf)"
     sysctl -q -p "$(rooted /etc/sysctl.d/90-compactdb.conf)"
   fi
 
-  repository=$(rooted /opt/compactdb/repository)
-  compactdb_sync_repository "$project_dir" "$repository"
-  compactdb_install_private_configuration "$project_dir/private" "$(rooted /etc/compactdb)"
-  install_commands_and_units "$repository"
-
   if [[ "$repair_only" != 1 ]]; then
+    installer_phase CREATING_VENV "$deployment_started"
     ensure_venv "$(rooted /opt/compactdb/venv)" "$repository/requirements.lock"
     ensure_venv "$(rooted /opt/compactdb/deploy-venv)" "$repository/deploy/requirements.lock"
   fi

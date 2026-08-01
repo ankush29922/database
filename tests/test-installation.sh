@@ -25,6 +25,9 @@ printf 'useradd\n' >>"$MOCK_LOG"
 MOCK
 cat >"$mock_bin/python3" <<'MOCK'
 #!/usr/bin/env bash
+if [[ ${1:-} == - ]]; then
+  exec /usr/bin/python3 "$@"
+fi
 [[ ${1:-} == -m && ${2:-} == venv && -n ${3:-} ]] || exit 2
 environment=$3
 install -d "$environment/bin"
@@ -98,7 +101,8 @@ done
 for command in usr/local/bin/compactdb usr/local/sbin/compactdb-deploy; do
   [[ -x "$fake_root/$command" ]]
 done
-for unit in compactdb-bot.service compactdb-deploy.service; do
+[[ -x "$fake_root/usr/local/libexec/compactdb-telegram-notifier.py" ]]
+for unit in compactdb-bot.service compactdb-deploy.service compactdb-notifier.service compactdb-notifier.timer; do
   [[ -f "$fake_root/etc/systemd/system/$unit" ]]
 done
 for configuration in bot.env deploy.env paths.env rclone.conf update.env; do
@@ -111,6 +115,9 @@ done
 [[ $(grep -c '^fallocate$' "$mock_log") -eq 1 ]]
 [[ $(grep -c '^deploy-launch$' "$mock_log") -eq 1 ]]
 [[ $(grep -c '^pip-install$' "$mock_log") -eq 2 ]]
+notifier_start_line=$(grep -n -m1 '^systemctl start --no-block compactdb-notifier.service$' "$mock_log" | cut -d: -f1)
+deploy_launch_line=$(grep -n -m1 '^deploy-launch$' "$mock_log" | cut -d: -f1)
+(( notifier_start_line < deploy_launch_line ))
 printf 'MOCK_FIRST_INSTALL=PASS\n'
 
 chmod 0644 "$fake_root/etc/compactdb/bot.env"
