@@ -233,34 +233,10 @@ else
   [[ -n ${RCLONE_REMOTE_SOURCE:-} && -s /etc/compactdb/rclone.conf ]] && rclone_configured=yes
   [[ -n ${GDRIVE_URL:-} ]] && gdown_configured=yes
   fallback=${GDOWN_FALLBACK_RCLONE:-yes}
-  case "$method" in
-    rclone)
-      [[ "$rclone_configured" == yes ]] || fail 20 CONFIGURATION_MISSING deploy.env 'rclone source or configuration is missing' 20
-      transfer_plan=rclone
-      ;;
-    gdown)
-      if [[ "$gdown_configured" == yes && "$fallback" == yes && "$rclone_configured" == yes ]]; then
-        transfer_plan=gdown_then_rclone
-      elif [[ "$gdown_configured" == yes ]]; then
-        transfer_plan=gdown
-      elif [[ "$fallback" == yes && "$rclone_configured" == yes ]]; then
-        transfer_plan=rclone
-      else
-        fail 20 CONFIGURATION_MISSING deploy.env 'gdown URL and rclone fallback are unavailable' 20
-      fi
-      ;;
-    auto)
-      if [[ "$gdown_configured" == yes && "$rclone_configured" == yes ]]; then
-        transfer_plan=gdown_then_rclone
-      elif [[ "$gdown_configured" == yes ]]; then
-        transfer_plan=gdown
-      elif [[ "$rclone_configured" == yes ]]; then
-        transfer_plan=rclone
-      else
-        fail 20 CONFIGURATION_MISSING deploy.env 'no Google Drive download method is configured' 20
-      fi
-      ;;
-  esac
+  if ! transfer_plan=$(compactdb_select_transfer_plan \
+      "$method" "$gdown_configured" "$rclone_configured" "$fallback"); then
+    fail 20 CONFIGURATION_MISSING deploy.env 'the selected Google Drive download method is not fully configured' 20
+  fi
   streams=${RCLONE_STREAMS:-8}
   [[ "$streams" == 8 || "$streams" == 4 ]] || streams=8
   profile="MAX_SPEED_${streams}_STREAM"
@@ -381,6 +357,17 @@ else
     return "$transfer_code"
   }
 
+  gdown_metadata_is_exact() {
+    metadata_snapshot
+    metadata_is_exact
+  }
+
+  run_rclone_fallback() {
+    state current_phase=FALLING_BACK_TO_RCLONE last_error_class=GDOWN_TRANSFER_FAILED
+    safe_log "phase=fallback from=gdown to=rclone reason=$COMPACTDB_GDOWN_FALLBACK_REASON"
+    run_rclone
+  }
+
   safe_log "phase=download method=$transfer_plan remote_bytes=$remote_bytes remote_files=$remote_files"
   case "$transfer_plan" in
     rclone)
@@ -390,14 +377,9 @@ else
       run_gdown || fail "$?" GDOWN_TRANSFER_FAILED gdown 'gdown transfer failed after its configured retries' 1
       ;;
     gdown_then_rclone)
-      if run_gdown; then
-        state selected_download_method=gdown
-      else
-        state current_phase=FALLING_BACK_TO_RCLONE last_error_class=GDOWN_TRANSFER_FAILED
-        safe_log 'phase=fallback from=gdown to=rclone'
-        run_rclone
-        state selected_download_method=rclone
-      fi
+      compactdb_gdown_with_rclone_fallback \
+        run_gdown gdown_metadata_is_exact run_rclone_fallback
+      state selected_download_method="$COMPACTDB_SELECTED_DOWNLOAD_METHOD"
       ;;
   esac
   rm -f -- "$inventory"
