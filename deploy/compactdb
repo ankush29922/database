@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE=/var/lib/compactdb/deployment-state.json
+
+need_root() {
+  if [[ $EUID -ne 0 ]]; then
+    exec sudo "$0" "$@"
+  fi
+}
+
+field() {
+  jq -r --arg key "$1" '.[$key] // "-"' "$STATE" 2>/dev/null || printf '%s' '-'
+}
+
+bounded_percentage() {
+  local value
+  value=$(field percentage)
+  awk -v value="$value" 'BEGIN{if(value+0<0)value=0; if(value+0>100)value=100; printf "%g",value+0}'
+}
+
+dashboard() {
+  local phase download files total_files bytes total_bytes bot
+  phase=$(field current_phase)
+  download=$(field DOWNLOAD_STATUS)
+  files=$(field completed_files)
+  total_files=$(field remote_package_files)
+  bytes=$(field downloaded_bytes)
+  total_bytes=$(field total_bytes)
+  bot=$(systemctl is-active compactdb-bot.service 2>/dev/null || true)
+
+  printf 'Phase: %s\n' "$phase"
+  printf 'Download: %s\n' "$download"
+  printf 'Files: %s/%s\n' "$files" "$total_files"
+  printf 'Bytes: %s/%s\n' "$bytes" "$total_bytes"
+  printf 'Progress: %s%%\n' "$(bounded_percentage)"
+  printf 'Bot: %s\n' "$bot"
+  printf 'Database mode: %s\n' "$(field database_mode)"
+
+  if [[ "$phase" != COMPLETE ]]; then
+    printf 'Transferred files: %s\n' "$(field transferred_files)"
+    printf 'Skipped files: %s\n' "$(field skipped_files)"
+    printf 'Total local files: %s\n' "$(field total_local_files)"
+    printf 'Current rate: %s B/s\n' "$(field current_rate)"
+    printf 'Average rate: %s B/s\n' "$(field average_rate)"
+    printf 'ETA seconds: %s\n' "$(field eta_seconds)"
+    printf 'Last error: %s\n' "$(field last_error_class)"
+  fi
+}
+
+command=${1:-status}
+shift || true
+
+case "$command" in
+  status)
+    need_root status "$@"
+    dashboard
+    printf 'Deploy service: %s\n' "$(systemctl is-active compactdb-deploy.service 2>/dev/null || true)"
+    printf 'App revision: %s\n' "$(field application_revision)"
+    ;;
+  progress)
+    need_root progress "$@"
+    if [[ $(field current_phase) == COMPLETE ]]; then
+      dashboard
+      exit 0
+    fi
+    trap 'tput cnorm 2>/dev/null || true; printf "\n"' EXIT INT TERM
+    tput civis 2>/dev/null || true
+    while true; do
+      printf '\033[H\033[2J'
+      dashboard
+      sleep 15
+    done
+    ;;
+  logs)
+    need_root logs "$@"
+    journalctl -u compactdb-deploy.service -u compactdb-bot.service -u compactdb-update.service --no-pager -n 150 -o short-iso
+    ;;
+  start|stop|restart)
+    need_root "$command" "$@"
+    systemctl "$command" compactdb-bot.service
+    ;;
+  update)
+    need_root update "$@"
+    systemctl start compactdb-update.service
+    ;;
+  rollback)
+    need_root rollback "$@"
+    [[ -L /opt/compactdb/previous ]] || { printf '%s\n' 'No previous release is available.' >&2; exit 1; }
+    current=$(readlink -f /opt/compactdb/current)
+    previous=$(readlink -f /opt/compactdb/previous)
+    ln -sfn "$current" /opt/compactdb/previous.new
+    ln -sfn "$previous" /opt/compactdb/current.new
+    mv -Tf /opt/compactdb/previous.new /opt/compactdb/previous
+    mv -Tf /opt/compactdb/current.new /opt/compactdb/current
+    systemctl restart compactdb-bot.service
+    ;;
+  *)
+    printf '%s\n' 'Usage: compactdb {status|progress|logs|start|stop|restart|update|rollback}' >&2
+    exit 2
+    ;;
+esac

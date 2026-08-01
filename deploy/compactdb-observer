@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+unit=${1:-compactdb-bot.service}
+case "$unit" in
+  compactdb-bot.service|compactdb-deploy.service|compactdb-update.service) ;;
+  *)
+    printf 'Unsupported unit: %s\n' "$unit" >&2
+    exit 2
+    ;;
+esac
+
+properties=$(systemctl show "$unit" \
+  --property=ActiveState \
+  --property=SubState \
+  --property=MainPID \
+  --no-pager)
+
+active_state=
+sub_state=
+main_pid=
+while IFS='=' read -r key value; do
+  case "$key" in
+    ActiveState) active_state=$value ;;
+    SubState) sub_state=$value ;;
+    MainPID) main_pid=$value ;;
+  esac
+done <<<"$properties"
+
+printf 'UNIT=%s\n' "$unit"
+printf 'ACTIVE_STATE=%s\n' "$active_state"
+printf 'SUB_STATE=%s\n' "$sub_state"
+printf 'MAIN_PID=%s\n' "$main_pid"
+
+if [[ "$unit" == compactdb-bot.service ]]; then
+  [[ "$active_state" == active && "$sub_state" == running && "$main_pid" =~ ^[1-9][0-9]*$ ]]
+else
+  [[ "$active_state" == active ]]
+fi

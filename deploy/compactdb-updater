@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+CONFIG=/etc/compactdb/update.env
+[[ -r "$CONFIG" ]] || exit 0
+# shellcheck disable=SC1090
+source "$CONFIG"
+[[ ${GITHUB_OWNER:-REPLACE_OWNER} != REPLACE_OWNER && ${GITHUB_REPO:-REPLACE_REPO} != REPLACE_REPO ]] || exit 0
+[[ -n ${GITHUB_TOKEN:-} ]] || exit 0
+branch=${GITHUB_BRANCH:-main}
+exec 9>/run/lock/compactdb-update.lock
+flock -n 9 || exit 0
+github_headers=(-H "Authorization: Bearer $GITHUB_TOKEN" -H 'Accept: application/vnd.github+json')
+revision=$(curl -fsSL --max-time 30 "${github_headers[@]}" "https://api.github.com/repos/$GITHUB_OWNER/$GITHUB_REPO/commits/$branch" | jq -r .sha)
+[[ "$revision" =~ ^[0-9a-f]{40}$ ]] || exit 1
+current=$(cat /var/lib/compactdb/application-revision 2>/dev/null || true)
+[[ "$revision" != "$current" ]] || exit 0
+work=$(mktemp -d /opt/compactdb/update.XXXXXX)
+trap 'rm -rf "$work"' EXIT
+curl -fsSL --retry 5 --max-time 300 "${github_headers[@]}" \
+  "https://api.github.com/repos/$GITHUB_OWNER/$GITHUB_REPO/tarball/$branch" \
+  -o "$work/source.tgz"
+tar -xzf "$work/source.tgz" -C "$work"
+root=$(find "$work" -mindepth 1 -maxdepth 1 -type d | head -n1)
+[[ -d "$root/app" && -f "$root/requirements.lock" ]] || exit 1
+release=/opt/compactdb/releases/$revision
+mkdir -p "$release"
+cp -a "$root/app/." "$release/"
+chown -R root:root "$release"; chmod -R a-w "$release"
+requirements=$(stat -c '%s:%Y' "$root/requirements.lock")
+installed=$(cat /opt/compactdb/.requirements-metadata 2>/dev/null || true)
+if [[ "$requirements" != "$installed" ]]; then
+  python3 -m venv "$work/venv"
+  "$work/venv/bin/pip" install --disable-pip-version-check -r "$root/requirements.lock" >/dev/null
+  rm -rf /opt/compactdb/venv.previous
+  [[ -d /opt/compactdb/venv ]] && mv /opt/compactdb/venv /opt/compactdb/venv.previous
+  mv "$work/venv" /opt/compactdb/venv
+  printf '%s\n' "$requirements" >/opt/compactdb/.requirements-metadata
+fi
+old=$(readlink -f /opt/compactdb/current)
+ln -sfn "$old" /opt/compactdb/previous
+ln -sfn "$release" /opt/compactdb/current.new
+mv -Tf /opt/compactdb/current.new /opt/compactdb/current
+ln -sfn /opt/compactdb/current /opt/compactdb/app.new
+mv -Tf /opt/compactdb/app.new /opt/compactdb/app
+if systemctl restart compactdb-bot.service && sleep 30 && systemctl is-active --quiet compactdb-bot.service; then
+  printf '%s\n' "$revision" >/var/lib/compactdb/application-revision
+  /usr/local/bin/compactdb-notify update-success
+else
+  ln -sfn "$old" /opt/compactdb/current.new
+  mv -Tf /opt/compactdb/current.new /opt/compactdb/current
+  if [[ -d /opt/compactdb/venv.previous ]]; then
+    rm -rf /opt/compactdb/venv
+    mv /opt/compactdb/venv.previous /opt/compactdb/venv
+  fi
+  systemctl restart compactdb-bot.service || true
+  /usr/local/bin/compactdb-notify update-rollback
+  exit 1
+fi

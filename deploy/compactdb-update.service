@@ -1,0 +1,13 @@
+[Unit]
+Description=CompactDB atomic application updater
+After=network-online.target compactdb-deploy.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/compactdb-updater
+TimeoutStartSec=15min
+Nice=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=compactdb-update

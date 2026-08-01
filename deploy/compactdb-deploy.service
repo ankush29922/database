@@ -1,0 +1,27 @@
+[Unit]
+Description=CompactDB durable deployment pipeline
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/compactdb/deploy.env
+ExecStart=/usr/local/sbin/compactdb-deploy
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=20 21 22 23 24 25
+Nice=-5
+CPUWeight=900
+IOWeight=900
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0
+TimeoutStartSec=infinity
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=compactdb-deploy
+
+[Install]
+WantedBy=multi-user.target

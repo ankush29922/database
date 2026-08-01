@@ -1,0 +1,7 @@
+[Unit]
+Description=Retry latest CompactDB owner notification
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/compactdb-notify retry

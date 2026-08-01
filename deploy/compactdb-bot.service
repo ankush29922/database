@@ -1,0 +1,50 @@
+[Unit]
+Description=CompactDB Telegram bot
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/srv/compactdb/CompactDB-Portable/database/compactdb-final.duckdb
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=compactdb
+Group=compactdb
+EnvironmentFile=/etc/compactdb/bot.env
+EnvironmentFile=/etc/compactdb/paths.env
+Environment=PYTHONUNBUFFERED=1
+Environment=DUCKDB_THREADS=1
+Environment=DUCKDB_MEMORY_LIMIT=384MB
+Environment=DUCKDB_MAX_TEMP_BYTES=134217728
+Environment=DUCKDB_MAX_CONCURRENT_QUERIES=1
+Environment=ENABLE_QUERY_CACHE=0
+Environment=QUERY_TIMEOUT_SECONDS=15
+WorkingDirectory=/opt/compactdb/current
+ExecStart=/opt/compactdb/venv/bin/python /opt/compactdb/current/service_entry.py
+ExecStartPost=+/usr/local/bin/compactdb-notify bot-started
+ExecStopPost=+/usr/local/bin/compactdb-notify bot-exit ${SERVICE_RESULT}
+Restart=always
+RestartSec=5
+RestartSteps=6
+RestartMaxDelaySec=5min
+TimeoutStopSec=20
+WatchdogSec=75
+MemoryHigh=560M
+MemoryMax=650M
+MemorySwapMax=512M
+OOMPolicy=stop
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/srv/compactdb/CompactDB-Portable
+ReadWritePaths=/var/lib/compactdb /var/log/compactdb
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=compactdb-bot
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200
+
+[Install]
+WantedBy=multi-user.target

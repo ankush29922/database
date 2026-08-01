@@ -1,0 +1,453 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+STATE=/var/lib/compactdb/deployment-state.json
+LOCK=/run/lock/compactdb-deploy.lock
+PACKAGE=/srv/compactdb/CompactDB-Portable
+SOURCE=/opt/compactdb/repository
+LOG=/var/log/compactdb/deploy.log
+DEPLOY_CONFIG=/etc/compactdb/deploy.env
+BOT_CONFIG=/etc/compactdb/bot.env
+EXPECTED_FILES=29
+EXPECTED_BYTES=220754442143
+EXPECTED_FINAL_BYTES=188926144512
+EXPECTED_LOOKUP_BYTES=24713113600
+EXPECTED_LOCATOR_BYTES=7114838560
+EXPECTED_MANIFEST_BYTES=222907
+FLOOR=$((5 * 1024 * 1024 * 1024))
+ALLOWANCE=$((1 * 1024 * 1024 * 1024))
+
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  exit 0
+fi
+
+mkdir -p "$PACKAGE" /var/lib/compactdb/runtime /var/lib/compactdb/duckdb-temp /var/log/compactdb /opt/compactdb/releases
+chown compactdb:compactdb /var/lib/compactdb/runtime /var/lib/compactdb/duckdb-temp
+chmod 0700 /var/lib/compactdb/runtime /var/lib/compactdb/duckdb-temp
+touch "$LOG"
+chmod 0600 "$LOG"
+
+state() {
+  python3 - "$STATE" "$@" <<'PY'
+import json
+import os
+import sys
+import time
+
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as stream:
+        data = json.load(stream)
+except Exception:
+    data = {}
+for item in sys.argv[2:]:
+    key, raw = item.split("=", 1)
+    if raw == "null":
+        value = None
+    elif raw in ("true", "false"):
+        value = raw == "true"
+    else:
+        try:
+            value = int(raw)
+        except ValueError:
+            try:
+                value = float(raw)
+            except ValueError:
+                value = raw
+    data[key] = value
+data["last_state_update"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+temporary = f"{path}.tmp.{os.getpid()}"
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(temporary, "w", encoding="utf-8") as stream:
+    json.dump(data, stream, sort_keys=True, separators=(",", ":"))
+    stream.write("\n")
+    stream.flush()
+    os.fsync(stream.fileno())
+os.chmod(temporary, 0o600)
+os.replace(temporary, path)
+PY
+}
+
+safe_log() {
+  printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >>"$LOG"
+}
+
+sanitize_line() {
+  local value=${1:-command failed}
+  printf '%s' "$value" |
+    tr '\r\n\t' '   ' |
+    sed -E \
+      -e 's#https?://[^ ]+#[REDACTED_URL]#g' \
+      -e 's/([Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Uu][Rr][Ll])=[^ ]+/\1=[REDACTED]/g' \
+      -e 's/[0-9]{6,}:[A-Za-z0-9_-]{20,}/[REDACTED_TOKEN]/g' \
+      -e 's/[0-9]{8,}/[REDACTED_NUMBER]/g' |
+    cut -c1-500
+}
+
+sanitize_command() {
+  local value=${1:-unknown}
+  value=${value%%[[:space:]]*}
+  value=${value##*/}
+  value=$(printf '%s' "$value" | tr -cd 'A-Za-z0-9._+-')
+  printf '%s' "${value:-unknown}"
+}
+
+CURRENT_PHASE=INITIALIZING
+CURRENT_ERROR_CLASS=APPLICATION_INSTALL_FAILED
+LAST_ERROR_LINE='command returned a nonzero exit status'
+ERROR_RECORDED=0
+
+record_failure() {
+  local code=$1 class=$2 command_name=$3 error_line=$4 failed_phase=${5:-$CURRENT_PHASE}
+  local when retries
+  (( ERROR_RECORDED == 0 )) || return 0
+  ERROR_RECORDED=1
+  trap - ERR
+  when=$(date -u +%FT%TZ)
+  command_name=$(sanitize_command "$command_name")
+  error_line=$(sanitize_line "$error_line")
+  retries=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("retries",0)))' "$STATE" 2>/dev/null || printf 0)
+  state current_phase="$class" failed_phase="$failed_phase" last_error_class="$class" \
+    failing_command="$command_name" exit_code="$code" final_error_line="$error_line" \
+    error_timestamp="$when" retries="$((retries + 1))" \
+    bot_service_state="$(systemctl is-active compactdb-bot.service 2>/dev/null || true)"
+  safe_log "phase=$failed_phase error_class=$class command=$command_name exit=$code error=$error_line"
+}
+
+unexpected_error() {
+  local code=$? command_name=${BASH_COMMAND:-unknown}
+  record_failure "$code" "$CURRENT_ERROR_CLASS" "$command_name" "$LAST_ERROR_LINE" "$CURRENT_PHASE"
+  exit "$code"
+}
+trap unexpected_error ERR
+
+fail() {
+  local code=$1 class=$2 command_name=$3 error_line=$4 exit_status=$5
+  record_failure "$code" "$class" "$command_name" "$error_line" "$CURRENT_PHASE"
+  exit "$exit_status"
+}
+
+run_quiet() {
+  local class=$1 command_name=$2 exit_status=$3
+  shift 3
+  local output code final_line
+  output=$(mktemp /run/compactdb-command.XXXXXX)
+  set +e
+  "$@" >"$output" 2>&1
+  code=$?
+  set -e
+  if (( code != 0 )); then
+    final_line=$(awk 'NF{line=$0} END{print line}' "$output")
+    rm -f -- "$output"
+    fail "$code" "$class" "$command_name" "${final_line:-command returned a nonzero exit status}" "$exit_status"
+  fi
+  rm -f -- "$output"
+}
+
+# Direct invocation receives the same private configuration as the systemd unit.
+# Loading is silent, and a malformed downloader configuration matters only if a
+# download phase is genuinely required.
+deploy_config_load_code=0
+if [[ -r "$DEPLOY_CONFIG" ]]; then
+  set +e
+  set -a
+  # shellcheck disable=SC1090
+  source "$DEPLOY_CONFIG" >/dev/null 2>&1
+  deploy_config_load_code=$?
+  set +a
+  set -e
+fi
+
+metadata_snapshot() {
+  local path
+  read -r local_files local_bytes < <(
+    find "$PACKAGE" -type f -printf '%s\n' 2>/dev/null |
+      awk '{count++; bytes += $1} END {printf "%d %.0f\n", count, bytes}'
+  )
+  path="$PACKAGE/database/compactdb-final.duckdb"
+  final_bytes=$([[ -f "$path" ]] && stat -c '%s' "$path" || printf 0)
+  path="$PACKAGE/database/compactdb-lookup.duckdb"
+  lookup_bytes=$([[ -f "$path" ]] && stat -c '%s' "$path" || printf 0)
+  path="$PACKAGE/database/compactdb-direct-locator.bin"
+  locator_bytes=$([[ -f "$path" ]] && stat -c '%s' "$path" || printf 0)
+  path="$PACKAGE/database/compactdb-direct-locator.json"
+  manifest_bytes=$([[ -f "$path" ]] && stat -c '%s' "$path" || printf 0)
+}
+
+metadata_is_exact() {
+  (( local_files == EXPECTED_FILES &&
+     local_bytes == EXPECTED_BYTES &&
+     final_bytes == EXPECTED_FINAL_BYTES &&
+     lookup_bytes == EXPECTED_LOOKUP_BYTES &&
+     locator_bytes == EXPECTED_LOCATOR_BYTES &&
+     manifest_bytes == EXPECTED_MANIFEST_BYTES ))
+}
+
+started=$(date -u +%FT%TZ)
+if [[ -s "$STATE" ]]; then
+  started=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("deployment_start_time") or sys.argv[2])' "$STATE" "$started")
+fi
+
+metadata_snapshot
+if metadata_is_exact; then
+  state DOWNLOAD_STATUS=COMPLETE_BY_EXACT_METADATA downloaded_bytes="$EXPECTED_BYTES" \
+    total_bytes="$EXPECTED_BYTES" percentage=100 completed_files="$EXPECTED_FILES" \
+    remote_package_files="$EXPECTED_FILES" total_local_files="$EXPECTED_FILES" \
+    transferred_files=0 skipped_files="$EXPECTED_FILES" current_rate=0 average_rate=0 \
+    network_receive_rate=0 eta_seconds=0 last_error_class=null \
+    deployment_start_time="$started"
+  safe_log "phase=metadata-reconciliation result=complete files=$EXPECTED_FILES bytes=$EXPECTED_BYTES"
+else
+  CURRENT_PHASE=PREFLIGHT
+  CURRENT_ERROR_CLASS=CONFIGURATION_MISSING
+  (( deploy_config_load_code == 0 )) ||
+    fail 20 CONFIGURATION_MISSING deploy.env 'deployment configuration could not be loaded' 20
+  method=${DOWNLOAD_METHOD:-}
+  if [[ "$method" != rclone && "$method" != gdown ]]; then
+    fail 20 CONFIGURATION_MISSING deploy.env 'DOWNLOAD_METHOD is required for an incomplete package' 20
+  fi
+  streams=${RCLONE_STREAMS:-8}
+  [[ "$streams" == 8 || "$streams" == 4 ]] || streams=8
+  profile="MAX_SPEED_${streams}_STREAM"
+  state current_phase=PREFLIGHT source_method="$method" deployment_start_time="$started" last_error_class=null
+
+  read -r disk_total disk_free fs_type < <(df -B1 --output=size,avail,fstype "$PACKAGE" | awk 'NR==2{print $1,$2,$3}')
+  memory_available=$(awk '/MemAvailable:/{print $2*1024}' /proc/meminfo)
+  swap_total=$(awk '/SwapTotal:/{print $2*1024}' /proc/meminfo)
+  existing=$local_bytes
+
+  if [[ "$method" == rclone ]]; then
+    [[ -n ${RCLONE_REMOTE_SOURCE:-} && -s /etc/compactdb/rclone.conf ]] ||
+      fail 20 CONFIGURATION_MISSING deploy.env 'rclone source or configuration is missing' 20
+    CURRENT_ERROR_CLASS=RCLONE_TRANSFER_FAILED
+    size_output=$(mktemp /run/compactdb-rclone-size.XXXXXX)
+    set +e
+    rclone size --config /etc/compactdb/rclone.conf --json "$RCLONE_REMOTE_SOURCE" >"$size_output" 2>/dev/null
+    size_code=$?
+    set -e
+    if (( size_code != 0 )); then
+      rm -f -- "$size_output"
+      fail "$size_code" RCLONE_TRANSFER_FAILED rclone 'remote package metadata request failed' 1
+    fi
+    remote_bytes=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["bytes"]))' "$size_output")
+    remote_files=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["count"]))' "$size_output")
+    rm -f -- "$size_output"
+  else
+    [[ ${REMOTE_PACKAGE_BYTES:-} =~ ^[0-9]+$ ]] ||
+      fail 20 CONFIGURATION_MISSING deploy.env 'REMOTE_PACKAGE_BYTES is required for gdown preflight' 20
+    [[ -n ${GDRIVE_URL:-} ]] ||
+      fail 20 CONFIGURATION_MISSING deploy.env 'GDRIVE_URL is required for gdown transfer' 20
+    remote_bytes=$REMOTE_PACKAGE_BYTES
+    remote_files=${REMOTE_PACKAGE_FILES:-0}
+  fi
+
+  remaining=$((remote_bytes - existing))
+  (( remaining < 0 )) && remaining=0
+  required=$((remaining + FLOOR + ALLOWANCE))
+  state remote_package_bytes="$remote_bytes" total_bytes="$remote_bytes" remote_package_files="$remote_files" \
+    filesystem_type="$fs_type" disk_total="$disk_total" disk_free="$disk_free" \
+    memory_available="$memory_available" swap_total="$swap_total" final_free_floor="$FLOOR" \
+    runtime_allowance="$ALLOWANCE" downloaded_bytes="$existing"
+  if (( disk_free < required )); then
+    fail 20 CONFIGURATION_MISSING storage-preflight 'the configured disk floor cannot be maintained' 20
+  fi
+
+  inventory=$(mktemp /run/compactdb-inventory.XXXXXX)
+  find "$PACKAGE" -type f ! -name '*.partial' ! -name '*.tmp' -printf '%P\t%s\n' | sort >"$inventory"
+  initial_bytes=$existing
+  initial_files=$local_files
+  transfer_started_epoch=$(date +%s)
+  previous_epoch=$transfer_started_epoch
+  network_interface=$(ip route show default | awk 'NR==1{print $5}')
+  previous_rx=$(cat "/sys/class/net/$network_interface/statistics/rx_bytes")
+
+  progress_snapshot() {
+    local snapshot now elapsed rx net_rate persistent_bytes persistent_files counts skipped transferred pct eta average phase
+    snapshot=$(mktemp /run/compactdb-progress.XXXXXX)
+    find "$PACKAGE" -type f ! -name '*.partial' ! -name '*.tmp' -printf '%P\t%s\n' | sort >"$snapshot"
+    read -r persistent_files persistent_bytes < <(awk '{count++; bytes += $NF} END {printf "%d %.0f\n", count, bytes}' "$snapshot")
+    read -r skipped transferred < <(
+      awk -F '\t' 'NR==FNR{before[$1]=$2; next} {if (($1 in before) && before[$1]==$2) skipped++; else transferred++} END{printf "%d %d\n", skipped, transferred}' "$inventory" "$snapshot"
+    )
+    now=$(date +%s)
+    elapsed=$((now - previous_epoch)); (( elapsed < 1 )) && elapsed=1
+    rx=$(cat "/sys/class/net/$network_interface/statistics/rx_bytes")
+    net_rate=$(((rx - previous_rx) / elapsed)); (( net_rate < 0 )) && net_rate=0
+    average=$(((persistent_bytes - initial_bytes) / (now - transfer_started_epoch + 1))); (( average < 0 )) && average=0
+    pct=$(awk -v value="$persistent_bytes" -v all="$remote_bytes" 'BEGIN{p=100*value/(all>0?all:1); if(p<0)p=0; if(p>100)p=100; printf "%.4f",p}')
+    if (( net_rate > 0 && remote_bytes > persistent_bytes )); then eta=$(((remote_bytes-persistent_bytes)/net_rate)); else eta=0; fi
+    phase=DOWNLOADING
+    if kill -0 "$transfer_pid" 2>/dev/null && (( net_rate == 0 )); then phase=FINALIZING_TRANSFER; fi
+    state current_phase="$phase" downloaded_bytes="$persistent_bytes" percentage="$pct" \
+      current_rate="$net_rate" average_rate="$average" network_receive_rate="$net_rate" \
+      eta_seconds="$eta" completed_files="$persistent_files" total_local_files="$persistent_files" \
+      transferred_files="$transferred" skipped_files="$skipped" last_progress_timestamp="$(date -u +%FT%TZ)"
+    previous_epoch=$now
+    previous_rx=$rx
+    rm -f -- "$snapshot"
+  }
+
+  run_rclone() {
+    CURRENT_PHASE=DOWNLOADING
+    CURRENT_ERROR_CLASS=RCLONE_TRANSFER_FAILED
+    state current_phase=DOWNLOADING performance_profile="$profile" transfer_count=1 stream_count="$streams"
+    rclone copy "$RCLONE_REMOTE_SOURCE" "$PACKAGE" \
+      --config /etc/compactdb/rclone.conf \
+      --transfers 1 --checkers 2 --buffer-size 8M \
+      --multi-thread-streams "$streams" --multi-thread-cutoff 256M \
+      --ignore-checksum --use-mmap --bwlimit off \
+      --retries 20 --retries-sleep 30s --low-level-retries 20 \
+      --timeout 5m --contimeout 30s --stats 15s --stats-one-line --log-level ERROR \
+      >/dev/null 2>&1 &
+    transfer_pid=$!
+    while kill -0 "$transfer_pid" 2>/dev/null; do
+      sleep 15 & wait $!
+      progress_snapshot
+    done
+    set +e
+    wait "$transfer_pid"
+    transfer_code=$?
+    set -e
+    (( transfer_code == 0 )) || fail "$transfer_code" RCLONE_TRANSFER_FAILED rclone 'rclone transfer failed after its configured retries' 1
+  }
+
+  run_gdown() {
+    CURRENT_PHASE=DOWNLOADING
+    CURRENT_ERROR_CLASS=GDOWN_TRANSFER_FAILED
+    if [[ ! -x /opt/compactdb/deploy-venv/bin/gdown ]]; then
+      run_quiet GDOWN_TRANSFER_FAILED python3 1 python3 -m venv /opt/compactdb/deploy-venv
+      run_quiet GDOWN_TRANSFER_FAILED pip 1 /opt/compactdb/deploy-venv/bin/pip install --disable-pip-version-check 'gdown==5.2.0'
+    fi
+    local attempt=1
+    while (( attempt <= 5 )); do
+      /opt/compactdb/deploy-venv/bin/gdown --folder --continue --remaining-ok --output "$PACKAGE" "$GDRIVE_URL" >/dev/null 2>&1 &
+      transfer_pid=$!
+      while kill -0 "$transfer_pid" 2>/dev/null; do sleep 15 & wait $!; progress_snapshot; done
+      set +e
+      wait "$transfer_pid"
+      transfer_code=$?
+      set -e
+      (( transfer_code == 0 )) && return 0
+      state retries="$attempt" last_error_class=GDOWN_TRANSFER_FAILED
+      attempt=$((attempt + 1))
+      sleep 30
+    done
+    fail "$transfer_code" GDOWN_TRANSFER_FAILED gdown 'gdown transfer failed after its configured retries' 1
+  }
+
+  safe_log "phase=download method=$method remote_bytes=$remote_bytes remote_files=$remote_files"
+  if [[ "$method" == rclone ]]; then run_rclone; else run_gdown; fi
+  rm -f -- "$inventory"
+
+  metadata_snapshot
+  if ! metadata_is_exact; then
+    CURRENT_PHASE=PACKAGE_METADATA_RECONCILIATION
+    fail 21 PACKAGE_METADATA_INCOMPLETE filesystem-metadata 'package file count or required file size differs from the exact manifest' 21
+  fi
+  state DOWNLOAD_STATUS=COMPLETE_BY_EXACT_METADATA downloaded_bytes="$EXPECTED_BYTES" \
+    total_bytes="$EXPECTED_BYTES" percentage=100 completed_files="$EXPECTED_FILES" \
+    remote_package_files="$EXPECTED_FILES" total_local_files="$EXPECTED_FILES" \
+    current_rate=0 average_rate=0 network_receive_rate=0 eta_seconds=0 last_error_class=null
+fi
+
+CURRENT_PHASE=INSTALLING_APPLICATION
+CURRENT_ERROR_CLASS=APPLICATION_INSTALL_FAILED
+state current_phase=INSTALLING_APPLICATION
+[[ -d "$SOURCE/app" && -f "$SOURCE/requirements.lock" ]] ||
+  fail 22 APPLICATION_INSTALL_FAILED repository 'application source or requirements.lock is missing' 22
+
+revision=${APPLICATION_REVISION:-local-$(date -u +%Y%m%dT%H%M%SZ)}
+[[ "$revision" =~ ^[A-Za-z0-9._-]+$ ]] ||
+  fail 22 APPLICATION_INSTALL_FAILED APPLICATION_REVISION 'application revision contains unsupported characters' 22
+release="/opt/compactdb/releases/$revision"
+if [[ ! -d "$release" ]]; then
+  staging="/opt/compactdb/releases/.${revision}.new.$$"
+  mkdir -p "$staging"
+  cp -a "$SOURCE/app/." "$staging/"
+  chown -R root:root "$staging"
+  chmod -R a-w "$staging"
+  mv "$staging" "$release"
+fi
+
+old_release=
+if [[ -L /opt/compactdb/current ]]; then
+  old_release=$(readlink -f /opt/compactdb/current || true)
+fi
+if [[ -n "$old_release" && "$old_release" != "$release" ]]; then
+  ln -sfn "$old_release" /opt/compactdb/previous
+fi
+ln -sfn "$release" /opt/compactdb/current.new
+mv -Tf /opt/compactdb/current.new /opt/compactdb/current
+ln -sfn /opt/compactdb/current /opt/compactdb/app.new
+mv -Tf /opt/compactdb/app.new /opt/compactdb/app
+
+CURRENT_PHASE=CREATING_VENV
+CURRENT_ERROR_CLASS=VENV_INSTALL_FAILED
+state current_phase=CREATING_VENV application_revision="$revision"
+requirements_marker=$(stat -c '%s:%Y' "$SOURCE/requirements.lock")
+installed_marker=$(cat /opt/compactdb/.requirements-metadata 2>/dev/null || true)
+if [[ ! -x /opt/compactdb/venv/bin/python || "$requirements_marker" != "$installed_marker" ]]; then
+  venv_staging=/opt/compactdb/venv.new
+  rm -rf -- "$venv_staging"
+  run_quiet VENV_INSTALL_FAILED python3 23 python3 -m venv "$venv_staging"
+  run_quiet VENV_INSTALL_FAILED pip 23 "$venv_staging/bin/pip" install --disable-pip-version-check -r "$SOURCE/requirements.lock"
+  rm -rf -- /opt/compactdb/venv.previous
+  [[ ! -d /opt/compactdb/venv ]] || mv /opt/compactdb/venv /opt/compactdb/venv.previous
+  mv "$venv_staging" /opt/compactdb/venv
+  printf '%s\n' "$requirements_marker" >/opt/compactdb/.requirements-metadata
+fi
+
+CURRENT_PHASE=CONFIGURING_BOT
+CURRENT_ERROR_CLASS=BOT_CONFIGURATION_FAILED
+state current_phase=CONFIGURING_BOT application_revision="$revision"
+[[ -s "$BOT_CONFIG" ]] ||
+  fail 24 BOT_CONFIGURATION_FAILED bot.env 'bot configuration file is missing or empty' 24
+set +e
+(
+  set -a
+  # shellcheck disable=SC1090
+  source "$BOT_CONFIG" >/dev/null 2>&1
+  [[ -n ${BOT_TOKEN:-} && -n ${BOT_OWNER_IDS:-} ]]
+) >/dev/null 2>&1
+bot_config_code=$?
+set -e
+(( bot_config_code == 0 )) ||
+  fail 24 BOT_CONFIGURATION_FAILED bot.env 'BOT_TOKEN or BOT_OWNER_IDS is missing' 24
+
+CURRENT_PHASE=STARTING_BOT
+CURRENT_ERROR_CLASS=BOT_START_FAILED
+state current_phase=STARTING_BOT application_revision="$revision"
+run_quiet BOT_START_FAILED systemctl 25 systemctl enable compactdb-bot.service
+systemctl reset-failed compactdb-bot.service >/dev/null 2>&1 || true
+run_quiet BOT_START_FAILED systemctl 25 systemctl start --no-block compactdb-bot.service
+
+startup_deadline=$((SECONDS + 75))
+start_restarts=$(systemctl show compactdb-bot.service -p NRestarts --value 2>/dev/null || printf 0)
+while (( SECONDS < startup_deadline )); do
+  bot_state=$(systemctl is-active compactdb-bot.service 2>/dev/null || true)
+  bot_restarts=$(systemctl show compactdb-bot.service -p NRestarts --value 2>/dev/null || printf 0)
+  if [[ "$bot_state" == active ]]; then
+    break
+  fi
+  if [[ "$bot_state" == failed || "$bot_state" == inactive || "$bot_restarts" -gt "$start_restarts" ]]; then
+    systemctl stop compactdb-bot.service >/dev/null 2>&1 || true
+    fail 25 BOT_START_FAILED compactdb-bot.service 'bot exited before reporting ready; service was stopped' 25
+  fi
+  sleep 1
+done
+if ! systemctl is-active --quiet compactdb-bot.service; then
+  systemctl stop compactdb-bot.service >/dev/null 2>&1 || true
+  fail 25 BOT_START_FAILED compactdb-bot.service 'bot did not report ready within 75 seconds; service was stopped' 25
+fi
+
+completed=$(date -u +%FT%TZ)
+state current_phase=COMPLETE DOWNLOAD_STATUS=COMPLETE_BY_EXACT_METADATA \
+  downloaded_bytes="$EXPECTED_BYTES" total_bytes="$EXPECTED_BYTES" percentage=100 \
+  completed_files="$EXPECTED_FILES" remote_package_files="$EXPECTED_FILES" \
+  total_local_files="$EXPECTED_FILES" current_rate=0 average_rate=0 network_receive_rate=0 \
+  eta_seconds=0 deployment_completion_time="$completed" bot_service_state=active \
+  database_mode=read-only full_scan_fallback=false last_error_class=null
+safe_log "phase=complete bot=active revision=$revision"
+/usr/local/bin/compactdb-notify deployment-complete >/dev/null 2>&1 || true
