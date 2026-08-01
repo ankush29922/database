@@ -18,6 +18,9 @@ EXPECTED_MANIFEST_BYTES=222907
 FLOOR=$((5 * 1024 * 1024 * 1024))
 ALLOWANCE=$((1 * 1024 * 1024 * 1024))
 
+# shellcheck source=download-lib.sh
+source "$SOURCE/deploy/download-lib.sh"
+
 exec 9>"$LOCK"
 if ! flock -n 9; then
   exit 0
@@ -339,15 +342,8 @@ else
     CURRENT_PHASE=DOWNLOADING
     CURRENT_ERROR_CLASS=RCLONE_TRANSFER_FAILED
     state current_phase=DOWNLOADING performance_profile="$profile" transfer_count=1 stream_count="$streams"
-    rclone copy "$RCLONE_REMOTE_SOURCE" "$PACKAGE" \
-      --config /etc/compactdb/rclone.conf \
-      --transfers 1 --checkers 2 --buffer-size 8M \
-      --multi-thread-streams "$streams" --multi-thread-cutoff 256M \
-      --partial-suffix .partial \
-      --ignore-checksum --use-mmap --bwlimit off \
-      --retries 20 --retries-sleep 30s --low-level-retries 20 \
-      --timeout 5m --contimeout 30s --stats 15s --stats-one-line --log-level ERROR \
-      >/dev/null 2>&1 &
+    compactdb_rclone_copy "$RCLONE_REMOTE_SOURCE" "$PACKAGE" \
+      /etc/compactdb/rclone.conf "$streams" >/dev/null 2>&1 &
     transfer_pid=$!
     while kill -0 "$transfer_pid" 2>/dev/null; do
       sleep 15 & wait $!
@@ -369,7 +365,8 @@ else
     fi
     local attempt=1
     while (( attempt <= 5 )); do
-      /opt/compactdb/deploy-venv/bin/gdown --folder --continue --remaining-ok --output "$PACKAGE" "$GDRIVE_URL" >/dev/null 2>&1 &
+      compactdb_gdown_folder /opt/compactdb/deploy-venv/bin/gdown \
+        "$GDRIVE_URL" "$PACKAGE" >/dev/null 2>&1 &
       transfer_pid=$!
       while kill -0 "$transfer_pid" 2>/dev/null; do sleep 15 & wait $!; progress_snapshot; done
       set +e

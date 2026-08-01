@@ -10,7 +10,7 @@ install -d "$mock_bin"
 cat >"$mock_bin/systemctl" <<'MOCK'
 #!/usr/bin/env bash
 case "$MOCK_SYSTEMD_STATE" in
-  active)
+  active|active_no_log)
     printf 'ActiveState=active\nSubState=running\nMainPID=4242\n'
     ;;
   failed)
@@ -35,7 +35,7 @@ grep -Fqx 'SUB_STATE=running' <<<"$active_output"
 grep -Fqx 'MAIN_PID=4242' <<<"$active_output"
 grep -Fqx 'TELEGRAM_APPLICATION_STARTED=yes' <<<"$active_output"
 
-for state in failed inactive; do
+for state in failed inactive active_no_log; do
   if PATH="$mock_bin:/usr/bin:/bin" MOCK_SYSTEMD_STATE="$state" \
       bash "$repository/deploy/compactdb-observer" >/dev/null; then
     printf '%s state was incorrectly healthy\n' "$state" >&2

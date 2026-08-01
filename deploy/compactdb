@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STATE=/var/lib/compactdb/deployment-state.json
+STATE=${COMPACTDB_STATE_PATH:-/var/lib/compactdb/deployment-state.json}
+OBSERVER=${COMPACTDB_OBSERVER_COMMAND:-/usr/local/bin/compactdb-observer}
 
 need_root() {
   if [[ $EUID -ne 0 ]]; then
@@ -27,7 +28,7 @@ dashboard() {
   total_files=$(field remote_package_files)
   bytes=$(field downloaded_bytes)
   total_bytes=$(field total_bytes)
-  if /usr/local/bin/compactdb-observer compactdb-bot.service >/dev/null 2>&1; then
+  if "$OBSERVER" compactdb-bot.service >/dev/null 2>&1; then
     bot=healthy
   else
     bot=unhealthy
@@ -59,7 +60,7 @@ case "$command" in
   status)
     need_root status "$@"
     dashboard
-    /usr/local/bin/compactdb-observer compactdb-bot.service || true
+    "$OBSERVER" compactdb-bot.service || true
     printf 'Deploy service: %s\n' "$(systemctl is-active compactdb-deploy.service 2>/dev/null || true)"
     printf 'App revision: %s\n' "$(field application_revision)"
     ;;

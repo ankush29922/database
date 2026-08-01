@@ -29,3 +29,7 @@ notification-pending.json
 .test-bootstrap.*
 .test-idempotency.*
 .test-observer.*
+.test-installation.*
+.test-download.*
+.test-detach.*
+.audit-artifacts/

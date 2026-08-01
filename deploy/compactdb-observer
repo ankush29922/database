@@ -39,7 +39,7 @@ if [[ "$unit" == compactdb-bot.service ]]; then
     telegram_started=yes
   fi
   printf 'TELEGRAM_APPLICATION_STARTED=%s\n' "$telegram_started"
-  [[ "$active_state" == active && "$sub_state" == running && "$main_pid" =~ ^[1-9][0-9]*$ ]]
+  [[ "$active_state" == active && "$sub_state" == running && "$main_pid" =~ ^[1-9][0-9]*$ && "$telegram_started" == yes ]]
 else
   [[ "$active_state" == active ]]
 fi

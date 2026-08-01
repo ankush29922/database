@@ -3,6 +3,13 @@
 This repository contains private production credentials. Keep the GitHub
 repository private and restrict collaborator access.
 
+## Fresh VPS requirements
+
+- Ubuntu 24.04 LTS or newer, amd64/x86-64, with at least 1 GiB RAM.
+- At least a 250 GB disk and 228 GB free on the filesystem containing `/srv`.
+- Outbound HTTPS access to GitHub, Ubuntu mirrors, PyPI, Google Drive, and the
+  Telegram Bot API, plus inbound SSH access for administration.
+
 On a fresh Ubuntu amd64 VPS, run exactly:
 
 ```bash
@@ -36,6 +43,11 @@ sudo compactdb repair
 Healthy means active, running, and a nonzero MainPID. It also checks for the
 privacy-safe Telegram `Application started` journal marker without printing
 journal contents. It does not use process-name matching or process counts.
+
+Completion is shown by `Phase: COMPLETE`, `Download:
+COMPLETE_BY_EXACT_METADATA`, `Progress: 100%`, `ACTIVE_STATE=active`,
+`SUB_STATE=running`, a nonzero `MAIN_PID`, and
+`TELEGRAM_APPLICATION_STARTED=yes`.
 
 The application opens both DuckDB files read-only, uses the verified lookup
 sidecar plus the direct locator, and has no full-scan fallback. Runtime writes
