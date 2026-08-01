@@ -41,10 +41,31 @@ compactdb_rclone_copy() {
     --config "$configuration" \
     --transfers 1 --checkers 2 --buffer-size 8M \
     --multi-thread-streams "$streams" --multi-thread-cutoff 256M \
-    --partial-suffix .partial \
-    --ignore-checksum --use-mmap --bwlimit off \
+    --ignore-existing --ignore-checksum --use-mmap --bwlimit off \
     --retries 20 --retries-sleep 30s --low-level-retries 20 \
     --timeout 5m --contimeout 30s --stats 15s --stats-one-line --log-level ERROR
+}
+
+compactdb_repair_gdown_launcher() {
+  local environment=$1 python launcher expected temporary
+  python="$environment/bin/python"
+  launcher="$environment/bin/gdown"
+  expected="#!$python"
+  [[ -x "$python" ]] || return 1
+  "$python" -c 'import gdown.cli' >/dev/null 2>&1 || return 1
+  if [[ -x "$launcher" && $(head -n 1 "$launcher" 2>/dev/null || true) == "$expected" ]]; then
+    return 0
+  fi
+  temporary="${launcher}.new.$$"
+  {
+    printf '%s\n' "$expected"
+    printf '%s\n' 'from gdown.cli import main'
+    printf '%s\n' 'if __name__ == "__main__":'
+    printf '%s\n' '    raise SystemExit(main())'
+  } >"$temporary"
+  chmod 0755 "$temporary"
+  chown --reference="$python" "$temporary"
+  mv -f -- "$temporary" "$launcher"
 }
 
 compactdb_gdown_folder() {

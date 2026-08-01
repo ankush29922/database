@@ -166,6 +166,28 @@ ensure_venv() {
   rm -rf -- "${environment}.previous"
   [[ ! -d "$environment" ]] || mv "$environment" "${environment}.previous"
   mv "$staging" "$environment"
+  python3 - "$environment" "$staging" <<'PY'
+import os
+import pathlib
+import sys
+
+environment = pathlib.Path(sys.argv[1])
+staging = sys.argv[2].encode()
+prefix = b"#!" + staging + b"/"
+replacement = b"#!" + str(environment).encode() + b"/"
+for launcher in (environment / "bin").iterdir():
+    if not launcher.is_file():
+        continue
+    data = launcher.read_bytes()
+    if not data.startswith(prefix):
+        continue
+    metadata = launcher.stat()
+    temporary = launcher.with_name(f".{launcher.name}.{os.getpid()}.tmp")
+    temporary.write_bytes(replacement + data[len(prefix):])
+    os.chmod(temporary, metadata.st_mode)
+    os.chown(temporary, metadata.st_uid, metadata.st_gid)
+    os.replace(temporary, launcher)
+PY
   printf '%s\n' "$marker" >"$marker_file"
   chown -R root:compactdb "$environment" "$marker_file"
   chmod -R go-w "$environment"
@@ -211,7 +233,7 @@ configure_systemd() {
 }
 
 repository_mode() {
-  local project_dir repository repair_only deployment_started
+  local project_dir repository repair_only deployment_started deploy_environment
   project_dir=$1
   repair_only=${COMPACTDB_REPAIR_ONLY:-0}
   deployment_started=${COMPACTDB_DEPLOYMENT_START_TIME:-$(date -u +%FT%TZ)}
@@ -220,6 +242,8 @@ repository_mode() {
 
   # shellcheck source=install-lib.sh
   source "$project_dir/deploy/install-lib.sh"
+  # shellcheck source=download-lib.sh
+  source "$project_dir/deploy/download-lib.sh"
 
   if ! id compactdb >/dev/null 2>&1; then
     useradd --system --home-dir /var/lib/compactdb --shell /usr/sbin/nologin --user-group compactdb
@@ -257,6 +281,14 @@ repository_mode() {
     installer_phase CREATING_VENV "$deployment_started"
     ensure_venv "$(rooted /opt/compactdb/venv)" "$repository/requirements.lock"
     ensure_venv "$(rooted /opt/compactdb/deploy-venv)" "$repository/deploy/requirements.lock"
+  fi
+  deploy_environment=$(rooted /opt/compactdb/deploy-venv)
+  if [[ -x "$deploy_environment/bin/python" ]] &&
+      ! compactdb_repair_gdown_launcher "$deploy_environment"; then
+    "$deploy_environment/bin/python" -m pip install --disable-pip-version-check \
+      --no-input -r "$repository/deploy/requirements.lock" >/dev/null
+    compactdb_repair_gdown_launcher "$deploy_environment" ||
+      die 'the permanent gdown launcher could not be repaired'
   fi
 
   install -d -m 0755 "$(rooted /etc/logrotate.d)"

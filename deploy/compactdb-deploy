@@ -363,9 +363,14 @@ else
     CURRENT_PHASE=DOWNLOADING_GDOWN
     CURRENT_ERROR_CLASS=GDOWN_TRANSFER_FAILED
     state current_phase=DOWNLOADING_GDOWN selected_download_method=gdown
-    if [[ ! -x /opt/compactdb/deploy-venv/bin/gdown ]]; then
+    if [[ ! -x /opt/compactdb/deploy-venv/bin/python ]]; then
       run_quiet GDOWN_TRANSFER_FAILED python3 1 python3 -m venv /opt/compactdb/deploy-venv
-      run_quiet GDOWN_TRANSFER_FAILED pip 1 /opt/compactdb/deploy-venv/bin/pip install --disable-pip-version-check -r "$SOURCE/deploy/requirements.lock"
+    fi
+    if ! compactdb_repair_gdown_launcher /opt/compactdb/deploy-venv; then
+      run_quiet GDOWN_TRANSFER_FAILED pip 1 /opt/compactdb/deploy-venv/bin/python \
+        -m pip install --disable-pip-version-check -r "$SOURCE/deploy/requirements.lock"
+      compactdb_repair_gdown_launcher /opt/compactdb/deploy-venv ||
+        fail 1 GDOWN_TRANSFER_FAILED gdown 'the permanent gdown launcher is unavailable' 1
     fi
     local attempt=1
     while (( attempt <= 5 )); do

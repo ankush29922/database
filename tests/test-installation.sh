@@ -34,9 +34,16 @@ install -d "$environment/bin"
 cat >"$environment/bin/pip" <<'PIP'
 #!/usr/bin/env bash
 printf 'pip-install\n' >>"$MOCK_LOG"
+environment=$(cd -- "$(dirname -- "$0")/.." && pwd)
+{
+  printf '#!%s/bin/python\n' "$environment"
+  printf '%s\n' 'from gdown.cli import main'
+} >"$environment/bin/gdown"
+chmod 0755 "$environment/bin/gdown"
 PIP
 cat >"$environment/bin/python" <<'PYTHON'
 #!/usr/bin/env bash
+printf 'permanent-python %s\n' "$*" >>"$MOCK_LOG"
 exit 0
 PYTHON
 chmod 0755 "$environment/bin/pip" "$environment/bin/python"
@@ -110,7 +117,13 @@ for configuration in bot.env deploy.env paths.env rclone.conf update.env; do
   [[ $(stat -c '%a:%U:%G' "$fake_root/etc/compactdb/$configuration") == 600:root:root ]]
 done
 [[ $(stat -c '%a:%U:%G' "$fake_root/opt/compactdb/venv") == 750:root:compactdb ]]
-[[ -x "$fake_root/opt/compactdb/deploy-venv/bin/gdown" || -x "$fake_root/opt/compactdb/deploy-venv/bin/python" ]]
+permanent_deploy_venv="$fake_root/opt/compactdb/deploy-venv"
+permanent_gdown="$permanent_deploy_venv/bin/gdown"
+[[ -x "$permanent_deploy_venv/bin/python" && -x "$permanent_gdown" ]]
+[[ $(head -n 1 "$permanent_gdown") == "#!$permanent_deploy_venv/bin/python" ]]
+[[ -z $(find "$fake_root/opt/compactdb" -maxdepth 1 -type d -name 'deploy-venv.new.*' -print -quit) ]]
+MOCK_LOG="$mock_log" "$permanent_gdown" --version
+grep -Fq "permanent-python $permanent_gdown --version" "$mock_log"
 [[ $(grep -c '^useradd$' "$mock_log") -eq 1 ]]
 [[ $(grep -c '^fallocate$' "$mock_log") -eq 1 ]]
 [[ $(grep -c '^deploy-launch$' "$mock_log") -eq 1 ]]
@@ -122,6 +135,13 @@ printf 'MOCK_FIRST_INSTALL=PASS\n'
 
 chmod 0644 "$fake_root/etc/compactdb/bot.env"
 find "$fake_root/etc/compactdb" -maxdepth 1 -type f -name rclone.conf -delete
+stale_python="$fake_root/opt/compactdb/deploy-venv.new.deleted/bin/python"
+{
+  printf '#!%s\n' "$stale_python"
+  printf '%s\n' 'raise SystemExit(99)'
+} >"$permanent_gdown"
+chmod 0755 "$permanent_gdown"
+[[ ! -e "$stale_python" ]]
 run_install
 [[ $(stat -c '%a:%U:%G' "$fake_root/etc/compactdb/bot.env") == 600:root:root ]]
 [[ $(stat -c '%a:%U:%G' "$fake_root/etc/compactdb/rclone.conf") == 600:root:root ]]
@@ -129,4 +149,9 @@ run_install
 [[ $(grep -c '^fallocate$' "$mock_log") -eq 1 ]]
 [[ $(grep -c '^deploy-launch$' "$mock_log") -eq 1 ]]
 [[ $(grep -c '^pip-install$' "$mock_log") -eq 2 ]]
+[[ -x "$permanent_gdown" ]]
+[[ $(head -n 1 "$permanent_gdown") == "#!$permanent_deploy_venv/bin/python" ]]
+MOCK_LOG="$mock_log" "$permanent_gdown" --version
 printf 'MOCK_REPEATED_INSTALL=PASS\n'
+printf 'MOCK_PERMANENT_GDOWN_AFTER_CLEANUP=PASS\n'
+printf 'MOCK_STALE_GDOWN_LAUNCHER_REPAIRED=PASS\n'
